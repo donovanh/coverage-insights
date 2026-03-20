@@ -16,6 +16,7 @@
     "analysis",
     "istanbul"
   ],
+  "main": "./dist/cli.js",
   "bin": {
     "coverage-insights": "./dist/cli.js"
   },
