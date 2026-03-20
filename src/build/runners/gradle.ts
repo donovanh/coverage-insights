@@ -34,7 +34,8 @@ function escapeTestName(name: string): string {
 // Note: parentheses in parameterised test names (e.g. myTest(param)) are not escaped
 // — Gradle may match the whole test class in those cases, which is an acceptable over-approximation.
 
-const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', entityExpansionLimit: Number.MAX_SAFE_INTEGER } as any);
 
 interface SuiteXml {
   testsuite?: {
@@ -142,6 +143,20 @@ export const gradleRunner: Runner = {
       }
     }
 
+    // Run cleanTest first to reset Gradle's incremental test tracking state.
+    // Without this, after runOne() has run each test individually with --rerun-tasks,
+    // Gradle considers all tests "passed recently" and skips them on the next plain `test` run.
+    const cleanTasks = taskArgs.map(t => {
+      const idx = t.lastIndexOf(':');
+      const taskName = idx >= 0 ? t.slice(idx + 1) : t;
+      const prefix   = idx >= 0 ? t.slice(0, idx + 1) : '';
+      return `${prefix}clean${taskName.charAt(0).toUpperCase()}${taskName.slice(1)}`;
+    });
+    try {
+      execFileSync(gradleCmd, [...cleanTasks, '--continue'], {
+        cwd: projectRoot, encoding: 'utf8', stdio: 'pipe',
+      });
+    } catch { /* ignore clean failures */ }
     try {
       execFileSync(gradleCmd, [...taskArgs, '--continue'], {
         cwd: projectRoot, encoding: 'utf8', stdio: 'pipe',
@@ -163,6 +178,12 @@ export const gradleRunner: Runner = {
     ensureSession(projectRoot);
     const gradleCmd = _gradleCmd!;
     const initScript = _initScriptPath!;
+
+    // Clean up any stale jacoco.xml files from a previous test in this worker slot.
+    // workerDir is reused across tests in the same worker; without this, mergeJacocoDir
+    // would pick up XML from prior tests and contaminate coverage results.
+    fs.rmSync(workerDir, { recursive: true, force: true });
+    fs.mkdirSync(workerDir, { recursive: true });
 
     const gradleModule = pathToModule(tc.filePath as string, projectRoot);
     const testFilter = escapeTestName(`${tc.describePath}.${tc.title}`);
