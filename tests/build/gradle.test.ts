@@ -220,4 +220,18 @@ describe('gradleRunner.aggregate', () => {
     await gradleRunner.aggregate(root, aggregateDir, undefined);
     expect(fs.existsSync(path.join(aggregateDir, 'coverage-final.json'))).toBe(true);
   });
+
+  it('emits a warning to stderr when no jacoco.xml found', async () => {
+    const root = path.join(tmpDir, 'project');
+    const aggregateDir = path.join(tmpDir, 'aggregate-empty');
+    fs.mkdirSync(root);
+    fs.mkdirSync(aggregateDir, { recursive: true });
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+    // No jacoco.xml written — aggregateDir is empty
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    await gradleRunner.aggregate(root, aggregateDir, undefined);
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('no jacoco.xml'));
+    stderrSpy.mockRestore();
+  });
 });

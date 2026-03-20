@@ -98,6 +98,10 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
   }
   scan(dir);
 
+  if (xmlFiles.length === 0) {
+    process.stderr.write(`  coverage-insights: no jacoco.xml found in ${dir} — aggregate coverage will be empty\n`);
+  }
+
   const maps = xmlFiles.map(f => {
     // <dir>/<moduleName>/jacoco.xml — derive real source path from module name
     const moduleName = path.basename(path.dirname(f));
