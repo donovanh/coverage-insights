@@ -4,6 +4,7 @@ import fs from 'fs';
 import { build } from './build/index.js';
 import { vitestRunner } from './build/runners/vitest.js';
 import { jestRunner } from './build/runners/jest.js';
+import { gradleRunner } from './build/runners/gradle.js';
 import { detectRunner } from './build/detect.js';
 import { analyse } from './analyse.js';
 import { consoleReport } from './report/console.js';
@@ -53,7 +54,9 @@ export async function main(): Promise<void> {
   process.stdout.write(`coverage-insights: scanning ${root}\n`);
 
   const runnerName = detectRunner(root, runnerFlag);
-  const runner = runnerName === 'jest' ? jestRunner : vitestRunner;
+  const runner = runnerName === 'jest' ? jestRunner
+               : runnerName === 'gradle' ? gradleRunner
+               : vitestRunner;
 
   const { map, summary } = await build({ projectRoot: root, outDir, concurrency, fileFilter, configPath }, runner);
 

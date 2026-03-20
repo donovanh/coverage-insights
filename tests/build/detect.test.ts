@@ -61,4 +61,30 @@ describe('detectRunner', () => {
     );
     expect(detectRunner('/project')).toBe('jest');
   });
+
+  it('returns "gradle" when --runner=gradle is passed', () => {
+    expect(detectRunner('/any', 'gradle')).toBe('gradle');
+  });
+
+  it('gradle flag beats build.gradle.kts when both present', () => {
+    mockExistsSync.mockImplementation(p => String(p).endsWith('build.gradle.kts'));
+    expect(detectRunner('/project', 'gradle')).toBe('gradle');
+  });
+
+  it('detects gradle from build.gradle.kts', () => {
+    mockExistsSync.mockImplementation(p => String(p).endsWith('build.gradle.kts'));
+    expect(detectRunner('/project')).toBe('gradle');
+  });
+
+  it('detects gradle from build.gradle', () => {
+    mockExistsSync.mockImplementation(p => String(p).endsWith('build.gradle'));
+    expect(detectRunner('/project')).toBe('gradle');
+  });
+
+  it('jest config takes priority over build.gradle.kts when both present', () => {
+    mockExistsSync.mockImplementation(p =>
+      String(p).endsWith('jest.config.js') || String(p).endsWith('build.gradle.kts')
+    );
+    expect(detectRunner('/project')).toBe('jest');
+  });
 });

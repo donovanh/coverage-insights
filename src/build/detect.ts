@@ -1,12 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import { JEST_CONFIG_NAMES, VITEST_CONFIG_NAMES } from './runners/common.js';
+import { JEST_CONFIG_NAMES, VITEST_CONFIG_NAMES, GRADLE_BUILD_NAMES } from './runners/common.js';
 
-export type RunnerType = 'vitest' | 'jest';
+export type RunnerType = 'vitest' | 'jest' | 'gradle';
 
 export function detectRunner(projectRoot: string, runnerFlag?: string): RunnerType {
   if (runnerFlag === 'jest') return 'jest';
   if (runnerFlag === 'vitest') return 'vitest';
+  if (runnerFlag === 'gradle') return 'gradle';
 
   // Check for jest config files
   for (const name of JEST_CONFIG_NAMES) {
@@ -25,6 +26,11 @@ export function detectRunner(projectRoot: string, runnerFlag?: string): RunnerTy
   // Check for vitest config files
   for (const name of VITEST_CONFIG_NAMES) {
     if (fs.existsSync(path.join(projectRoot, name))) return 'vitest';
+  }
+
+  // Check for Gradle build files
+  for (const name of GRADLE_BUILD_NAMES) {
+    if (fs.existsSync(path.join(projectRoot, name))) return 'gradle';
   }
 
   return 'vitest';
