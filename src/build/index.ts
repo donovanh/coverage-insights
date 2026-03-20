@@ -145,6 +145,8 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
 
   await Promise.all(Array.from({ length: concurrency }, (_, i) => worker(i)));
   clearProgress();
+  // Remove per-test worker directories now that coverage data has been extracted into map.
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
   if (process.stderr.isTTY) process.stderr.write(`  Per-test runs complete. Running aggregate coverage pass...\n`);
 
   // ── Step 3: Aggregate ────────────────────────────────────────────────────────

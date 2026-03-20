@@ -272,6 +272,7 @@ export const gradleRunner: Runner = {
     // Run test and jacocoTestReport in separate invocations because --tests is
     // a Test-task-specific option and Gradle rejects it when applied to jacocoTestReport.
     const commonArgs = [
+      '--no-daemon',
       '--rerun-tasks',
       '--init-script', initScript,
       `-Pcoverage.insights.xmlDir=${workerDir}`,
@@ -312,6 +313,7 @@ export const gradleRunner: Runner = {
       execFileSync(gradleCmd, [
         'test', 'jacocoTestReport',
         '--continue',
+        '--no-daemon',
         '--rerun-tasks',
         '--init-script', initScript,
         `-Pcoverage.insights.xmlDir=${aggregateDir}`,
@@ -319,5 +321,10 @@ export const gradleRunner: Runner = {
     } catch { /* test failures OK */ }
 
     mergeJacocoDir(aggregateDir, projectRoot);
+
+    // Kill any stray daemons from previous runs as a safety net. Best-effort.
+    try {
+      execFileSync(gradleCmd, ['--stop'], { cwd: projectRoot, encoding: 'utf8', stdio: 'pipe' });
+    } catch { /* ignore */ }
   },
 };
