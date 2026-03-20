@@ -57,12 +57,18 @@ function parseSurefireXml(content: string, modulePath: string): TestCase[] {
   const cases = raw ? (Array.isArray(raw) ? raw : [raw]) : [];
   return cases
     .filter(tc => tc.skipped === undefined)
-    .map(tc => ({
-      filePath:    modulePath,
-      fullName:    `${tc['@_classname'] ?? className} > ${tc['@_name']}`,
-      title:       tc['@_name'],
-      describePath: tc['@_classname'] ?? className,
-    }));
+    .map(tc => {
+      // JUnit 5 appends "()" to method names in Surefire XML (e.g. "should format date()").
+      // Gradle's --tests filter does not accept the trailing parens, so strip them here.
+      const rawName = tc['@_name'];
+      const title = rawName.endsWith('()') ? rawName.slice(0, -2) : rawName;
+      return {
+        filePath:    modulePath,
+        fullName:    `${tc['@_classname'] ?? className} > ${title}`,
+        title,
+        describePath: tc['@_classname'] ?? className,
+      };
+    });
 }
 
 function findSurefireXml(dir: string): string[] {
@@ -155,17 +161,30 @@ export const gradleRunner: Runner = {
     const testFilter = escapeTestName(`${tc.describePath}.${tc.title}`);
 
     const taskPrefix = gradleModule ? `${gradleModule}:` : '';
-    const args = [
-      `${taskPrefix}test`,
-      `${taskPrefix}jacocoTestReport`,
-      '--tests', testFilter,
+    // Run test and jacocoTestReport in separate invocations because --tests is
+    // a Test-task-specific option and Gradle rejects it when applied to jacocoTestReport.
+    const commonArgs = [
       '--rerun-tasks',
       '--init-script', initScript,
       `-Pcoverage.insights.xmlDir=${workerDir}`,
     ];
+    const testArgs = [
+      `${taskPrefix}test`,
+      '--tests', testFilter,
+      ...commonArgs,
+    ];
+    const reportArgs = [
+      `${taskPrefix}jacocoTestReport`,
+      ...commonArgs,
+    ];
 
     await new Promise<void>((resolve, reject) => {
-      execFile(gradleCmd, args, { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, err => {
+      execFile(gradleCmd, testArgs, { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, err => {
+        if (err) reject(err); else resolve();
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      execFile(gradleCmd, reportArgs, { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, err => {
         if (err) reject(err); else resolve();
       });
     });
