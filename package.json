@@ -2,6 +2,20 @@
   "name": "coverage-insights",
   "version": "0.3.8",
   "description": "Per-test Vitest/Jest coverage analysis — find redundant tests and under-covered source",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/donovanh/coverage-insights.git"
+  },
+  "homepage": "https://github.com/donovanh/coverage-insights#readme",
+  "keywords": [
+    "coverage",
+    "vitest",
+    "jest",
+    "gradle",
+    "testing",
+    "analysis",
+    "istanbul"
+  ],
   "bin": {
     "coverage-insights": "./dist/cli.js"
   },
