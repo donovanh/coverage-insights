@@ -22,6 +22,8 @@ export interface Runner {
   discover(projectRoot: string, fileFilter: string | undefined, configPath: string | undefined): Promise<TestCase[]>;
   runOne(tc: TestCase, projectRoot: string, workerDir: string, configPath: string | undefined): Promise<void>;
   aggregate(projectRoot: string, aggregateDir: string, configPath: string | undefined): Promise<void>;
+  /** Override the default concurrency for this runner. If omitted, the CPU-based default is used. */
+  defaultConcurrency?: number;
 }
 
 /** Return the path from /packages/ onward, or relative to projectRoot, else return as-is. */
@@ -75,10 +77,11 @@ function buildCoverageSummary(coverageFinal: Record<string, unknown>): CoverageS
   return summary;
 }
 
-const DEFAULT_CONCURRENCY = Math.max(1, Math.min(Math.floor(os.cpus().length / 2), 10));
+const CPU_CONCURRENCY = Math.max(1, Math.min(Math.floor(os.cpus().length / 2), 10));
 
 export async function build(opts: BuildOptions, runner: Runner): Promise<BuildResult> {
-  const { projectRoot, outDir, concurrency = DEFAULT_CONCURRENCY, fileFilter, configPath } = opts;
+  const defaultConcurrency = runner.defaultConcurrency ?? CPU_CONCURRENCY;
+  const { projectRoot, outDir, concurrency = defaultConcurrency, fileFilter, configPath } = opts;
 
   fs.mkdirSync(outDir, { recursive: true });
 

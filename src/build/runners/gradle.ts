@@ -236,6 +236,9 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
 }
 
 export const gradleRunner: Runner = {
+  // Gradle incurs JVM startup overhead per test; keep concurrency low by default.
+  defaultConcurrency: 2,
+
   async discover(projectRoot, fileFilter, _configPath) {
     ensureSession(projectRoot);
     const modules    = parseModules(projectRoot);
