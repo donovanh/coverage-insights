@@ -15,9 +15,9 @@
     "lint": "eslint src tests --config eslint.config.mjs",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "prepublishOnly": "npm run build && npm test",
-    "release:patch": "npm version patch && npm publish",
-    "release:minor": "npm version minor && npm publish",
-    "release:major": "npm version major && npm publish"
+    "release:patch": "npm run build && npm test && npm version patch && npm publish",
+    "release:minor": "npm run build && npm test && npm version minor && npm publish",
+    "release:major": "npm run build && npm test && npm version major && npm publish"
   },
   "peerDependencies": {
     "vitest": ">=1.0.0"
