@@ -2,3 +2,6 @@ node_modules/
 dist/
 coverage-insights/
 *.tsbuildinfo
+CLAUDE.md
+docs/
+.worktrees/
