@@ -92,15 +92,15 @@ describe('CLI main() (unit — no real subprocesses)', () => {
     expect(mockConsoleReport).toHaveBeenCalledWith(FAKE_REPORT, expect.any(Object));
   });
 
-  it('writes report.html when --html flag is passed', async () => {
-    process.argv = ['node', 'cli.js', `--root=${outDir}`, `--out=${outDir}/out`, '--html'];
+  it('writes report.html by default', async () => {
+    process.argv = ['node', 'cli.js', `--root=${outDir}`, `--out=${outDir}/out`];
     await main();
     expect(mockHtmlReport).toHaveBeenCalled();
     expect(fs.existsSync(path.join(outDir, 'out', 'report.html'))).toBe(true);
   });
 
-  it('does not write report.html when --html flag is absent', async () => {
-    process.argv = ['node', 'cli.js', `--root=${outDir}`, `--out=${outDir}/out`];
+  it('does not write report.html when --no-html is passed', async () => {
+    process.argv = ['node', 'cli.js', `--root=${outDir}`, `--out=${outDir}/out`, '--no-html'];
     await main();
     expect(mockHtmlReport).not.toHaveBeenCalled();
   });

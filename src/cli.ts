@@ -26,7 +26,7 @@ function parseArgs(argv: string[]): {
 
   const root        = path.resolve(get('--root=')        ?? process.cwd());
   const outDir      = path.resolve(root, get('--out=')   ?? 'coverage-insights');
-  const html        = args.includes('--html');
+  const html        = !args.includes('--no-html');
   const fileFilter  = get('--file=');
   const configPath  = get('--config=') ? path.resolve(get('--config=')!) : undefined;
   const rawConc     = get('--concurrency=');
