@@ -75,7 +75,7 @@ function buildCoverageSummary(coverageFinal: Record<string, unknown>): CoverageS
   return summary;
 }
 
-const DEFAULT_CONCURRENCY = Math.max(1, Math.min(Math.floor(os.cpus().length / 2), 4));
+const DEFAULT_CONCURRENCY = Math.max(1, Math.min(Math.floor(os.cpus().length / 2), 10));
 
 export async function build(opts: BuildOptions, runner: Runner): Promise<BuildResult> {
   const { projectRoot, outDir, concurrency = DEFAULT_CONCURRENCY, fileFilter, configPath } = opts;
