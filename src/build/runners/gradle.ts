@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { XMLParser } from 'fast-xml-parser';
-import type { Runner, TestCase } from './index.js';
+import type { Runner, TestCase } from '../index.js';
 import { parseModules, moduleToPath, pathToModule, findGradleCommand } from './gradle/settings.js';
 import { parseJacocoXml, mergeIstanbulMaps } from './gradle/jacoco.js';
 import { generateInitScript, detectJacoco } from './gradle/init-script.js';
