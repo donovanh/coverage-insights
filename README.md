@@ -1,6 +1,6 @@
 # coverage-insights
 
-Per-test coverage analysis for Vitest and Jest — find redundant tests, fragile lines, and coverage gaps.
+Per-test coverage analysis for Vitest, Jest, and Gradle/JVM projects — find redundant tests, fragile lines, and coverage gaps.
 
 Runs your test suite once per test file, collects per-test line coverage, and cross-references it to surface actionable findings.
 
@@ -14,7 +14,7 @@ npx coverage-insights
 npm install -g coverage-insights
 ```
 
-Requires Node.js 18+. Vitest or Jest must be installed in the project you're analysing.
+Requires Node.js 18+. Vitest or Jest must be installed in JS/TS projects. For Gradle projects, a JDK and Gradle wrapper (`gradlew`) are required.
 
 ## Usage
 
@@ -36,7 +36,7 @@ coverage-insights [options]
 | `--top=<n>` | all | Limit each section to top N findings |
 | `--file=<glob>` | all | Only run tests matching this pattern |
 | `--config=<path>` | auto | Path to vitest/jest config file |
-| `--runner=vitest\|jest` | auto | Force a specific runner (otherwise auto-detected) |
+| `--runner=vitest\|jest\|gradle` | auto | Force a specific runner (otherwise auto-detected) |
 | `--concurrency=<n>` | auto | Max parallel test runs |
 
 ### Examples
@@ -54,6 +54,34 @@ coverage-insights --file="src/auth/**" --html
 # Limit output to top 20 findings per section
 coverage-insights --top=20 --html
 ```
+
+## Gradle / JVM projects
+
+`coverage-insights` auto-detects Gradle projects by looking for `build.gradle.kts` or `build.gradle` in the project root. JaCoCo is used for coverage — if it is not already configured in your build, the runner injects it automatically via a Gradle init script.
+
+```bash
+# Auto-detected from build.gradle.kts
+coverage-insights --html
+
+# Force Gradle runner explicitly
+coverage-insights --runner=gradle --html
+
+# Limit to a specific module (substring match on module path)
+coverage-insights --runner=gradle --file=application --html
+```
+
+**Supported test engines:** JUnit 5 (Jupiter) and KoTest. Both are discovered and isolated automatically.
+
+**Requirements:**
+- JDK on `PATH` (`JAVA_HOME` set)
+- Gradle wrapper (`./gradlew`) in the project root, or `gradle` on `PATH`
+- Multi-module projects: `settings.gradle.kts` or `settings.gradle` with `include(...)` entries
+
+**Known limitations:**
+- Maven is not supported (Gradle only)
+- Branch coverage is not reported — JaCoCo's bytecode-level branch model doesn't map to the Istanbul format used internally
+- The `--file` flag filters by **module name substring**, not a file glob (e.g. `--file=application` runs only the `:application` module)
+- Per-test runs invoke Gradle once per test, which incurs JVM startup overhead each time — use `--file` to limit scope on large projects
 
 ## Output
 
