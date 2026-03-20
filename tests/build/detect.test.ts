@@ -1,0 +1,64 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+vi.mock('fs');
+
+import fs from 'fs';
+import { detectRunner } from '../../src/build/detect.js';
+
+const mockExistsSync = vi.mocked(fs.existsSync);
+const mockReadFileSync = vi.mocked(fs.readFileSync);
+
+describe('detectRunner', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns "jest" when --runner=jest is passed', () => {
+    expect(detectRunner('/any', 'jest')).toBe('jest');
+  });
+
+  it('returns "vitest" when --runner=vitest is passed', () => {
+    expect(detectRunner('/any', 'vitest')).toBe('vitest');
+  });
+
+  it('flag overrides config files — jest flag beats vitest.config.ts', () => {
+    mockExistsSync.mockImplementation(p => String(p).endsWith('vitest.config.ts'));
+    expect(detectRunner('/project', 'jest')).toBe('jest');
+  });
+
+  it('detects jest from jest.config.js', () => {
+    mockExistsSync.mockImplementation(p => String(p).endsWith('jest.config.js'));
+    expect(detectRunner('/project')).toBe('jest');
+  });
+
+  it('detects jest from jest.config.ts', () => {
+    mockExistsSync.mockImplementation(p => String(p).endsWith('jest.config.ts'));
+    expect(detectRunner('/project')).toBe('jest');
+  });
+
+  it('detects jest from "jest" key in package.json', () => {
+    mockExistsSync.mockImplementation(p => String(p).endsWith('package.json'));
+    mockReadFileSync.mockImplementation((p: string | Buffer | number) => {
+      if (String(p).endsWith('package.json')) return JSON.stringify({ jest: {} });
+      return '';
+    });
+    expect(detectRunner('/project')).toBe('jest');
+  });
+
+  it('detects vitest from vitest.config.ts', () => {
+    mockExistsSync.mockImplementation(p => String(p).endsWith('vitest.config.ts'));
+    expect(detectRunner('/project')).toBe('vitest');
+  });
+
+  it('defaults to vitest when no config found', () => {
+    mockExistsSync.mockReturnValue(false);
+    expect(detectRunner('/project')).toBe('vitest');
+  });
+
+  it('jest config takes priority over vitest config when both present', () => {
+    mockExistsSync.mockImplementation(p =>
+      String(p).endsWith('jest.config.js') || String(p).endsWith('vitest.config.ts')
+    );
+    expect(detectRunner('/project')).toBe('jest');
+  });
+});
