@@ -102,7 +102,10 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
     if (completedSoFar === 0) return '';
     const mins = (elapsedMs / completedSoFar) * (total - completedSoFar) / 60000;
     if (mins < 1) return '< 1 min';
-    return `~${Math.ceil(mins)} min${Math.ceil(mins) !== 1 ? 's' : ''}`;
+    if (mins < 60) return `~${Math.ceil(mins)} min${Math.ceil(mins) !== 1 ? 's' : ''}`;
+    const h = Math.floor(mins / 60);
+    const m = Math.round(mins % 60);
+    return m === 0 ? `~${h}h` : `~${h}h ${m}m`;
   }
 
   function progress(): void {
