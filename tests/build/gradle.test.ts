@@ -67,11 +67,25 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-// Write fake Surefire XML files at the expected path
+// Write fake Surefire XML files at the expected path (used by runOne/aggregate tests)
 function writeSurefireXml(projectRoot: string, module: string, filename: string, content: string) {
   const dir = path.join(projectRoot, module, 'build', 'test-results', 'test');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, filename), content);
+}
+
+// Write a Java test source file at src/test/java/<pkg path>/<className>.java
+function writeJavaTestFile(projectRoot: string, module: string, pkg: string, className: string, content: string) {
+  const dir = path.join(projectRoot, module, 'src', 'test', 'java', ...pkg.split('.'));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${className}.java`), content);
+}
+
+// Write a Kotlin test source file at src/test/kotlin/<pkg path>/<className>.kt
+function writeKotlinTestFile(projectRoot: string, module: string, pkg: string, className: string, content: string) {
+  const dir = path.join(projectRoot, module, 'src', 'test', 'kotlin', ...pkg.split('.'));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${className}.kt`), content);
 }
 
 // Write fake JaCoCo XML at the path the init script would produce
@@ -82,26 +96,34 @@ function writeJacocoXml(baseDir: string, moduleName: string, content: string) {
 }
 
 describe('gradleRunner.discover', () => {
-  it('returns TestCase for each non-skipped testcase in Surefire XML', async () => {
-    // Set up a minimal multi-module project
+  it('returns TestCase for each @Test method in Java source files', async () => {
     const root = path.join(tmpDir, 'project');
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-    writeSurefireXml(root, 'application', 'TEST-com.example.FormatterTest.xml', SUREFIRE_JUNIT);
+    writeJavaTestFile(root, 'application', 'com.example', 'FormatterTest', `
+      package com.example;
+      public class FormatterTest {
+        @Test void shouldFormatDate() {}
+        @Test void shouldHandleNull() {}
+      }
+    `);
 
     const cases = await gradleRunner.discover(root, undefined, undefined);
-    // shouldFormatDate + shouldHandleNull (failing tests are included), skipped is excluded
     expect(cases).toHaveLength(2);
     expect(cases.map(c => c.title)).toContain('shouldFormatDate');
     expect(cases.map(c => c.title)).toContain('shouldHandleNull');
-    expect(cases.map(c => c.title)).not.toContain('skippedTest');
   });
 
   it('sets filePath to module directory', async () => {
     const root = path.join(tmpDir, 'project');
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-    writeSurefireXml(root, 'application', 'TEST-com.example.FormatterTest.xml', SUREFIRE_JUNIT);
+    writeJavaTestFile(root, 'application', 'com.example', 'FormatterTest', `
+      package com.example;
+      public class FormatterTest {
+        @Test void shouldFormatDate() {}
+      }
+    `);
 
     const cases = await gradleRunner.discover(root, undefined, undefined);
     expect(cases[0].filePath).toBe(path.join(root, 'application'));
@@ -111,17 +133,27 @@ describe('gradleRunner.discover', () => {
     const root = path.join(tmpDir, 'project');
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-    writeSurefireXml(root, 'application', 'TEST-com.example.FormatterTest.xml', SUREFIRE_JUNIT);
+    writeJavaTestFile(root, 'application', 'com.example', 'FormatterTest', `
+      package com.example;
+      public class FormatterTest {
+        @Test void shouldFormatDate() {}
+      }
+    `);
 
     const cases = await gradleRunner.discover(root, undefined, undefined);
     expect(cases[0].describePath).toBe('com.example.FormatterTest');
   });
 
-  it('handles KoTest display names with spaces', async () => {
+  it('handles KoTest DSL string-based test names', async () => {
     const root = path.join(tmpDir, 'project');
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":api")');
-    writeSurefireXml(root, 'api', 'TEST-com.example.CalculatorSpec.xml', SUREFIRE_KOTEST);
+    writeKotlinTestFile(root, 'api', 'com.example', 'CalculatorSpec', `
+      package com.example
+      class CalculatorSpec : StringSpec({
+        "Calculator - should add two numbers" { }
+      })
+    `);
 
     const cases = await gradleRunner.discover(root, undefined, undefined);
     expect(cases).toHaveLength(1);
@@ -132,8 +164,18 @@ describe('gradleRunner.discover', () => {
     const root = path.join(tmpDir, 'project');
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":api", ":application")');
-    writeSurefireXml(root, 'application', 'TEST-com.example.FormatterTest.xml', SUREFIRE_JUNIT);
-    writeSurefireXml(root, 'api', 'TEST-com.example.CalculatorSpec.xml', SUREFIRE_KOTEST);
+    writeJavaTestFile(root, 'application', 'com.example', 'FormatterTest', `
+      package com.example;
+      public class FormatterTest {
+        @Test void shouldFormatDate() {}
+      }
+    `);
+    writeKotlinTestFile(root, 'api', 'com.example', 'CalculatorSpec', `
+      package com.example
+      class CalculatorSpec : StringSpec({
+        "should add" { }
+      })
+    `);
 
     const cases = await gradleRunner.discover(root, 'api', undefined);
     expect(cases.every(c => String(c.filePath).includes('api'))).toBe(true);

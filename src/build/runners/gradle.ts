@@ -88,10 +88,123 @@ function findSurefireXml(dir: string): string[] {
   return results;
 }
 
-function modulePathFromXml(xmlPath: string): string {
-  const marker = path.join('build', 'test-results');
-  const idx = xmlPath.indexOf(marker);
-  return idx >= 0 ? xmlPath.slice(0, idx - 1) : path.dirname(xmlPath);
+/** Return all test source directories for the project and its submodules. */
+function findTestSourceDirs(
+  projectRoot: string,
+  modules: string[],
+): Array<{ dir: string; modulePath: string }> {
+  const dirs: Array<{ dir: string; modulePath: string }> = [];
+  const candidates = [
+    path.join('src', 'test', 'java'),
+    path.join('src', 'test', 'kotlin'),
+    'test',
+  ];
+  for (const candidate of candidates) {
+    const d = path.join(projectRoot, candidate);
+    if (fs.existsSync(d)) dirs.push({ dir: d, modulePath: projectRoot });
+  }
+  for (const m of modules) {
+    const modPath = moduleToPath(m, projectRoot);
+    for (const candidate of candidates) {
+      const d = path.join(modPath, candidate);
+      if (fs.existsSync(d)) dirs.push({ dir: d, modulePath: modPath });
+    }
+  }
+  return dirs;
+}
+
+/** Recursively collect all .java and .kt files under dir. */
+function findSourceFiles(dir: string, results: string[] = []): string[] {
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) findSourceFiles(full, results);
+      else if (entry.isFile() && (entry.name.endsWith('.java') || entry.name.endsWith('.kt')))
+        results.push(full);
+    }
+  } catch { /* ignore unreadable dirs */ }
+  return results;
+}
+
+/** Parse @Test-annotated method names from a Java source file. */
+function parseJavaTestFile(content: string, modulePath: string): TestCase[] {
+  const packageMatch = content.match(/^\s*package\s+([\w.]+)\s*;/m);
+  const packageName  = packageMatch ? packageMatch[1] : '';
+  const classMatch   = content.match(/(?:public\s+|abstract\s+|final\s+)*class\s+(\w+)/);
+  if (!classMatch) return [];
+  const fqcn = packageName ? `${packageName}.${classMatch[1]}` : classMatch[1];
+
+  const testCases: TestCase[] = [];
+  // Split on @Test / @ParameterizedTest / @RepeatedTest (with optional params).
+  // Use \b so @TestMethodOrder etc. are not matched.
+  const parts = content.split(/@(?:Test|ParameterizedTest|RepeatedTest)\b(?:\s*\([^)]*\))?/);
+  for (let i = 1; i < parts.length; i++) {
+    let text = parts[i];
+    // Strip other annotations that may appear between @Test and the method signature
+    text = text.replace(/@\w+(?:\s*\([^)]*\))?\s*/g, ' ');
+    // Strip access/type modifiers so the first remaining word(+paren) is the method name
+    text = text.replace(/\b(?:public|protected|private|static|final|abstract|synchronized|native|strictfp|void)\b/g, ' ');
+    const m = text.match(/\b(\w+)\s*\(/);
+    if (m && m[1] !== 'class' && m[1] !== 'new') {
+      testCases.push({
+        filePath:    modulePath,
+        fullName:    `${fqcn} > ${m[1]}`,
+        title:       m[1],
+        describePath: fqcn,
+      });
+    }
+  }
+  return testCases;
+}
+
+/** Parse test names from a Kotlin test file (JUnit5 @Test and KoTest DSL). */
+function parseKotlinTestFile(content: string, modulePath: string): TestCase[] {
+  const packageMatch = content.match(/^\s*package\s+([\w.]+)/m);
+  const packageName  = packageMatch ? packageMatch[1] : '';
+  const classMatch   = content.match(/class\s+(\w+)/);
+  if (!classMatch) return [];
+  const fqcn = packageName ? `${packageName}.${classMatch[1]}` : classMatch[1];
+
+  const testCases: TestCase[] = [];
+
+  // JUnit5-style: @Test before a fun declaration (including backtick names)
+  const annotatedParts = content.split(/@(?:Test|ParameterizedTest|RepeatedTest)\b(?:\s*\([^)]*\))?/);
+  for (let i = 1; i < annotatedParts.length; i++) {
+    let text = annotatedParts[i];
+    text = text.replace(/@\w+(?:\s*\([^)]*\))?\s*/g, ' ');
+    // Backtick name: fun `some description`()
+    const btMatch = text.match(/fun\s+`([^`]+)`/);
+    if (btMatch) {
+      testCases.push({ filePath: modulePath, fullName: `${fqcn} > ${btMatch[1]}`, title: btMatch[1], describePath: fqcn });
+      continue;
+    }
+    // Plain name: fun testSomething()
+    const plainMatch = text.match(/fun\s+(\w+)\s*\(/);
+    if (plainMatch) {
+      testCases.push({ filePath: modulePath, fullName: `${fqcn} > ${plainMatch[1]}`, title: plainMatch[1], describePath: fqcn });
+    }
+  }
+
+  // KoTest DSL: "test name" { ... } or it("test name") / should("test name") / then("test name") etc.
+  // Matches string-literal test names passed to common KoTest DSL methods.
+  const kotestDsl = /\b(?:it|test|should|then|context|describe|given|when|expect|and)\s*\(\s*"([^"]+)"\s*\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = kotestDsl.exec(content)) !== null) {
+    const title = match[1];
+    testCases.push({ filePath: modulePath, fullName: `${fqcn} > ${title}`, title, describePath: fqcn });
+  }
+
+  // KoTest StringSpec / FreeSpec bare string blocks: "test name" { }
+  const bareString = /"([^"]+)"\s*\{/g;
+  while ((match = bareString.exec(content)) !== null) {
+    const title = match[1];
+    // Avoid duplicating tests already caught by the DSL pattern above
+    if (!testCases.some(tc => tc.title === title && tc.describePath === fqcn)) {
+      testCases.push({ filePath: modulePath, fullName: `${fqcn} > ${title}`, title, describePath: fqcn });
+    }
+  }
+
+  return testCases;
 }
 
 function mergeJacocoDir(dir: string, projectRoot: string): void {
@@ -125,51 +238,18 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
 export const gradleRunner: Runner = {
   async discover(projectRoot, fileFilter, _configPath) {
     ensureSession(projectRoot);
-    const gradleCmd = _gradleCmd!;
-
-    const modules = parseModules(projectRoot);
-    // Detect whether the root project itself has test sources (e.g. projects that keep
-    // tests at the root alongside submodules, rather than exclusively in submodules).
-    const rootHasTests = fs.existsSync(path.join(projectRoot, 'test'))
-                      || fs.existsSync(path.join(projectRoot, 'src', 'test'));
-    let taskArgs: string[];
-    if (modules.length === 0) {
-      taskArgs = ['test'];
-    } else {
-      const filtered = fileFilter ? modules.filter(m => m.includes(fileFilter)) : modules;
-      taskArgs = filtered.map(m => `${m}:test`);
-      if (rootHasTests) {
-        taskArgs = ['test', ...taskArgs];
-      }
-    }
-
-    // Run cleanTest first to reset Gradle's incremental test tracking state.
-    // Without this, after runOne() has run each test individually with --rerun-tasks,
-    // Gradle considers all tests "passed recently" and skips them on the next plain `test` run.
-    const cleanTasks = taskArgs.map(t => {
-      const idx = t.lastIndexOf(':');
-      const taskName = idx >= 0 ? t.slice(idx + 1) : t;
-      const prefix   = idx >= 0 ? t.slice(0, idx + 1) : '';
-      return `${prefix}clean${taskName.charAt(0).toUpperCase()}${taskName.slice(1)}`;
-    });
-    try {
-      execFileSync(gradleCmd, [...cleanTasks, '--continue'], {
-        cwd: projectRoot, encoding: 'utf8', stdio: 'pipe',
-      });
-    } catch { /* ignore clean failures */ }
-    try {
-      execFileSync(gradleCmd, [...taskArgs, '--continue'], {
-        cwd: projectRoot, encoding: 'utf8', stdio: 'pipe',
-      });
-    } catch { /* test failures are OK — Surefire XML is still written */ }
-
-    const xmlFiles = findSurefireXml(projectRoot);
+    const modules    = parseModules(projectRoot);
+    const sourceDirs = findTestSourceDirs(projectRoot, modules);
     const testCases: TestCase[] = [];
-    for (const f of xmlFiles) {
-      const modulePath = modulePathFromXml(f);
+    for (const { dir, modulePath } of sourceDirs) {
       if (fileFilter && !modulePath.includes(fileFilter)) continue;
-      const content = fs.readFileSync(f, 'utf8');
-      testCases.push(...parseSurefireXml(content, modulePath));
+      for (const file of findSourceFiles(dir)) {
+        const content = fs.readFileSync(file, 'utf8');
+        const parsed  = file.endsWith('.kt')
+          ? parseKotlinTestFile(content, modulePath)
+          : parseJavaTestFile(content, modulePath);
+        testCases.push(...parsed);
+      }
     }
     return testCases;
   },
