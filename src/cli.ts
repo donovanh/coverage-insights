@@ -22,7 +22,15 @@ function parseArgs(argv: string[]): {
   runnerFlag?: string;
 } {
   const args = argv.slice(2);
-  const get = (prefix: string) => args.find(a => a.startsWith(prefix))?.split('=').slice(1).join('=');
+  const get = (prefix: string): string | undefined => {
+    const withEq = args.find(a => a.startsWith(prefix));
+    if (withEq !== undefined) return withEq.split('=').slice(1).join('=');
+    // Also handle space-separated form: --flag value
+    const bare = prefix.replace(/=$/, '');
+    const idx  = args.indexOf(bare);
+    if (idx >= 0 && idx + 1 < args.length && !args[idx + 1].startsWith('-')) return args[idx + 1];
+    return undefined;
+  };
 
   const root        = path.resolve(get('--root=')        ?? process.cwd());
   const outDir      = path.resolve(root, get('--out=')   ?? 'coverage-insights');
