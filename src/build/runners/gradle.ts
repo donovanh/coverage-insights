@@ -127,12 +127,19 @@ export const gradleRunner: Runner = {
     const gradleCmd = _gradleCmd!;
 
     const modules = parseModules(projectRoot);
+    // Detect whether the root project itself has test sources (e.g. projects that keep
+    // tests at the root alongside submodules, rather than exclusively in submodules).
+    const rootHasTests = fs.existsSync(path.join(projectRoot, 'test'))
+                      || fs.existsSync(path.join(projectRoot, 'src', 'test'));
     let taskArgs: string[];
     if (modules.length === 0) {
       taskArgs = ['test'];
     } else {
       const filtered = fileFilter ? modules.filter(m => m.includes(fileFilter)) : modules;
       taskArgs = filtered.map(m => `${m}:test`);
+      if (rootHasTests) {
+        taskArgs = ['test', ...taskArgs];
+      }
     }
 
     try {
