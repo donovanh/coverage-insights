@@ -1,6 +1,6 @@
 {
   "name": "coverage-insights",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Per-test Vitest/Jest coverage analysis — find redundant tests and under-covered source",
   "bin": {
     "coverage-insights": "./dist/cli.js"
