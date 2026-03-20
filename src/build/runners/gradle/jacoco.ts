@@ -91,11 +91,18 @@ export function mergeIstanbulMaps(maps: IstanbulCoverage[]): IstanbulCoverage {
   for (const map of maps) {
     for (const [file, data] of Object.entries(map)) {
       if (!merged[file]) {
+        // statementMap and fnMap are structural metadata derived from the source file.
+        // They are identical across all JaCoCo reports for the same file — only
+        // execution counts (s, f) vary. We keep the first occurrence as-is.
+        // branchMap is always {} because JaCoCo branch data is not mapped to Istanbul
+        // branch format; it is hardcoded here rather than copied from data.branchMap
+        // to ensure a clean empty object regardless of input.
         merged[file] = {
           s: { ...data.s }, statementMap: data.statementMap,
           f: { ...data.f }, fnMap: data.fnMap, branchMap: {},
         };
       } else {
+        // Duplicate file entry: sum execution counts only.
         for (const id of Object.keys(data.s)) {
           merged[file].s[id] = (merged[file].s[id] ?? 0) + data.s[id];
         }
