@@ -245,8 +245,9 @@ export const gradleRunner: Runner = {
     const sourceDirs = findTestSourceDirs(projectRoot, modules);
     const testCases: TestCase[] = [];
     for (const { dir, modulePath } of sourceDirs) {
-      if (fileFilter && !modulePath.includes(fileFilter)) continue;
+      if (fileFilter && !modulePath.includes(fileFilter) && !dir.includes(fileFilter)) continue;
       for (const file of findSourceFiles(dir)) {
+        if (fileFilter && !modulePath.includes(fileFilter) && !file.includes(fileFilter)) continue;
         const content = fs.readFileSync(file, 'utf8');
         const parsed  = file.endsWith('.kt')
           ? parseKotlinTestFile(content, modulePath)
