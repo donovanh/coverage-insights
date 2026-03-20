@@ -139,6 +139,24 @@ describe('gradleRunner.discover', () => {
     expect(cases.every(c => String(c.filePath).includes('api'))).toBe(true);
     expect(cases.some(c => String(c.filePath).includes('application'))).toBe(false);
   });
+
+  it('caches session state — init script written only once across multiple calls', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+    writeSurefireXml(root, 'application', 'TEST-com.example.FormatterTest.xml', SUREFIRE_JUNIT);
+
+    const writeSpy = vi.spyOn(fs, 'writeFileSync');
+    await gradleRunner.discover(root, undefined, undefined);
+    const writesAfterFirst = writeSpy.mock.calls.filter(c => String(c[0]).includes('.init.gradle.kts')).length;
+
+    await gradleRunner.discover(root, undefined, undefined);
+    const writesAfterSecond = writeSpy.mock.calls.filter(c => String(c[0]).includes('.init.gradle.kts')).length;
+
+    expect(writesAfterFirst).toBe(1);
+    expect(writesAfterSecond).toBe(1); // no additional writes — session cached
+    writeSpy.mockRestore();
+  });
 });
 
 describe('gradleRunner.runOne', () => {

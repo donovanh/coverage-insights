@@ -31,6 +31,8 @@ function ensureSession(projectRoot: string): void {
 function escapeTestName(name: string): string {
   return name.replace(/\*/g, '\\*').replace(/\?/g, '\\?');
 }
+// Note: parentheses in parameterised test names (e.g. myTest(param)) are not escaped
+// — Gradle may match the whole test class in those cases, which is an acceptable over-approximation.
 
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 
@@ -68,7 +70,7 @@ function findSurefireXml(dir: string): string[] {
   try {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory() && entry.name !== 'node_modules' && entry.name !== '.git') {
+      if (entry.isDirectory() && entry.name !== '.gradle' && entry.name !== '.git') {
         results.push(...findSurefireXml(full));
       } else if (entry.isFile() && entry.name.startsWith('TEST-') && entry.name.endsWith('.xml')
         && dir.includes(path.join('build', 'test-results'))) {
@@ -103,9 +105,9 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
   }
 
   const maps = xmlFiles.map(f => {
-    // <dir>/<moduleName>/jacoco.xml — derive real source path from module name
-    const moduleName = path.basename(path.dirname(f));
-    const realModulePath = path.join(projectRoot, moduleName);
+    // <dir>/<moduleRelPath>/jacoco.xml — derive real source path from relative module path
+    const moduleRelPath = path.relative(dir, path.dirname(f));
+    const realModulePath = path.join(projectRoot, moduleRelPath);
     return parseJacocoXml(fs.readFileSync(f, 'utf8'), realModulePath, projectRoot);
   });
 
@@ -177,6 +179,8 @@ export const gradleRunner: Runner = {
     const gradleCmd = _gradleCmd!;
     const initScript = _initScriptPath!;
 
+    // Unqualified task names intentionally run across all subprojects.
+    // aggregate does not scope by module — it always covers the whole project.
     try {
       execFileSync(gradleCmd, [
         'test', 'jacocoTestReport',

@@ -9,7 +9,7 @@ allprojects {
             if (baseDir != null) {
                 reports {
                     xml.required.set(true)
-                    xml.outputLocation.set(file("\$baseDir/\${project.name}/jacoco.xml"))
+                    xml.outputLocation.set(file("\$baseDir/\${project.path.trimStart(':').replace(':', '/')}/jacoco.xml"))
                 }
             }
         }
