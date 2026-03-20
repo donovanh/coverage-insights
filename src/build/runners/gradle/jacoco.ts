@@ -23,7 +23,7 @@ interface JacocoPackage {
 }
 interface JacocoReport { report?: { package?: JacocoPackage | JacocoPackage[] } }
 
-const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', processEntities: false });
 
 /** Resolve absolute path for a JaCoCo source file entry. Falls back to relative path. */
 function resolveSourcePath(pkgName: string, filename: string, modulePath: string): string {
