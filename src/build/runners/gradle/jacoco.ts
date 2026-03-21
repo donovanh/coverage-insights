@@ -87,6 +87,33 @@ export function parseJacocoXml(
   return coverage;
 }
 
+/**
+ * Lightweight alternative to parseJacocoXml for per-test runs.
+ * Extracts only covered line numbers — skips fnMap/branchMap entirely.
+ * Returns { [absPath]: sortedLineNumbers[] }.
+ */
+export function extractCoveredLines(
+  xmlContent: string,
+  modulePath: string,
+): Record<string, number[]> {
+  const doc = parser.parse(xmlContent) as JacocoReport;
+  const result: Record<string, number[]> = {};
+  for (const pkg of toArray(doc.report?.package)) {
+    const pkgName = pkg['@_name'];
+    for (const sf of toArray(pkg.sourcefile)) {
+      const lines = toArray(sf.line)
+        .filter(l => parseInt(l['@_ci'], 10) > 0)
+        .map(l => parseInt(l['@_nr'], 10));
+      if (lines.length === 0) continue;
+      const absPath = resolveSourcePath(pkgName, sf['@_name'], modulePath);
+      if (!result[absPath]) result[absPath] = [];
+      for (const n of lines) if (!result[absPath].includes(n)) result[absPath].push(n);
+    }
+  }
+  for (const key of Object.keys(result)) result[key].sort((a, b) => a - b);
+  return result;
+}
+
 /** Merge multiple Istanbul coverage maps, summing counts for the same file. */
 export function mergeIstanbulMaps(maps: IstanbulCoverage[]): IstanbulCoverage {
   const merged: IstanbulCoverage = {};

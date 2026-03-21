@@ -5,7 +5,7 @@ import path from 'path';
 import { XMLParser } from 'fast-xml-parser';
 import type { Runner, TestCase } from '../index.js';
 import { parseModules, moduleToPath, pathToModule, findGradleCommand } from './gradle/settings.js';
-import { parseJacocoXml, mergeIstanbulMaps } from './gradle/jacoco.js';
+import { parseJacocoXml, mergeIstanbulMaps, extractCoveredLines } from './gradle/jacoco.js';
 import { generateInitScript, detectJacoco } from './gradle/init-script.js';
 
 // Session state — initialised lazily by whichever method is called first
@@ -207,7 +207,7 @@ function parseKotlinTestFile(content: string, modulePath: string): TestCase[] {
   return testCases;
 }
 
-function mergeJacocoDir(dir: string, projectRoot: string): void {
+function scanJacocoXml(dir: string): string[] {
   const xmlFiles: string[] = [];
   function scan(d: string) {
     try {
@@ -219,9 +219,18 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
     } catch { /* ignore */ }
   }
   scan(dir);
+  return xmlFiles;
+}
+
+/** Full Istanbul conversion — used by aggregate() where fnMap/branchMap are needed. */
+function mergeJacocoDir(dir: string, projectRoot: string): void {
+  fs.mkdirSync(dir, { recursive: true });
+  const xmlFiles = scanJacocoXml(dir);
 
   if (xmlFiles.length === 0) {
     process.stderr.write(`  coverage-insights: no jacoco.xml found in ${dir} — aggregate coverage will be empty\n`);
+    fs.writeFileSync(path.join(dir, 'coverage-final.json'), '{}', 'utf8');
+    return;
   }
 
   const maps = xmlFiles.map(f => {
@@ -232,6 +241,24 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
   });
 
   const merged = mergeIstanbulMaps(maps);
+  fs.writeFileSync(path.join(dir, 'coverage-final.json'), JSON.stringify(merged), 'utf8');
+}
+
+/** Compact line-only extraction — used by runOne() to skip the Istanbul intermediate. */
+function mergeLinesFromJacocoDir(dir: string, projectRoot: string): void {
+  const xmlFiles = scanJacocoXml(dir);
+  const merged: Record<string, number[]> = {};
+
+  for (const f of xmlFiles) {
+    const moduleRelPath = path.relative(dir, path.dirname(f));
+    const realModulePath = path.join(projectRoot, moduleRelPath);
+    const lines = extractCoveredLines(fs.readFileSync(f, 'utf8'), realModulePath);
+    for (const [absPath, lineNums] of Object.entries(lines)) {
+      if (!merged[absPath]) { merged[absPath] = lineNums; continue; }
+      for (const n of lineNums) if (!merged[absPath].includes(n)) merged[absPath].push(n);
+    }
+  }
+  for (const key of Object.keys(merged)) merged[key].sort((a, b) => a - b);
   fs.writeFileSync(path.join(dir, 'coverage-final.json'), JSON.stringify(merged), 'utf8');
 }
 
@@ -301,8 +328,8 @@ export const gradleRunner: Runner = {
       });
     });
 
-    // Convert JaCoCo XML(s) in workerDir to coverage-final.json
-    mergeJacocoDir(workerDir, projectRoot);
+    // Convert JaCoCo XML(s) in workerDir to compact coverage-final.json (lines only).
+    mergeLinesFromJacocoDir(workerDir, projectRoot);
   },
 
   async aggregate(projectRoot, aggregateDir, _configPath) {
@@ -312,6 +339,7 @@ export const gradleRunner: Runner = {
 
     // Unqualified task names intentionally run across all subprojects.
     // aggregate does not scope by module — it always covers the whole project.
+    fs.mkdirSync(aggregateDir, { recursive: true });
     try {
       execFileSync(gradleCmd, [
         'test', 'jacocoTestReport',

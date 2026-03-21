@@ -38,6 +38,12 @@ function shortPath(p: string, projectRoot?: string): string {
 function extractLines(coverageMap: Record<string, unknown>, projectRoot?: string): Record<string, number[]> {
   const result: Record<string, number[]> = {};
   for (const [file, fileCov] of Object.entries(coverageMap)) {
+    // Compact format written by Gradle's mergeLinesFromJacocoDir: { [absPath]: number[] }
+    if (Array.isArray(fileCov)) {
+      if ((fileCov as number[]).length > 0)
+        result[shortPath(file, projectRoot)] = fileCov as number[];
+      continue;
+    }
     const cov = fileCov as { s: Record<string, number>; statementMap: Record<string, { start: { line: number } }> };
     const lines = new Set<number>();
     for (const [id, count] of Object.entries(cov.s)) {
