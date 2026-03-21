@@ -10,6 +10,7 @@ vi.mock('child_process', () => ({
 
 import { execFileSync, execFile } from 'child_process';
 import { gradleRunner, _resetSession } from '../../src/build/runners/gradle.js';
+import { generateInitScript } from '../../src/build/runners/gradle/init-script.js';
 
 const mockExecFileSync = vi.mocked(execFileSync);
 const mockExecFile = vi.mocked(execFile);
@@ -501,6 +502,28 @@ describe('gradleRunner.runOne', () => {
     const args = mockExecFile.mock.calls[0][1] as string[];
     const testsIdx = args.indexOf('--tests');
     expect(args[testsIdx + 1]).toContain('\\*');
+  });
+});
+
+describe('generateInitScript', () => {
+  it('includes coverage.insights.jsonDir property check in redirect block', () => {
+    const script = generateInitScript(false);
+    expect(script).toContain('coverage.insights.jsonDir');
+    expect(script).toContain('ExecFileLoader');
+    expect(script).toContain('CoverageBuilder');
+    expect(script).toContain('coverage-final.json');
+  });
+
+  it('includes coverage.insights.jsonDir property check in injection block', () => {
+    const script = generateInitScript(true);
+    expect(script).toContain('coverage.insights.jsonDir');
+    expect(script).toContain('ExecFileLoader');
+  });
+
+  it('still wires finalizedBy when jsonDir not set (XML mode)', () => {
+    const script = generateInitScript(false);
+    expect(script).toContain('finalizedBy');
+    expect(script).toContain('jacocoTestReport');
   });
 });
 

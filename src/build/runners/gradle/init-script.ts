@@ -16,9 +16,84 @@ allprojects {
         tasks.withType<Test> {
             outputs.upToDateWhen { false }
             jvmArgs("-XX:TieredStopAtLevel=1")
-            finalizedBy("jacocoTestReport")
+            val jsonDir = providers.gradleProperty("coverage.insights.jsonDir").orNull
+            if (jsonDir != null) {
+                val classesFiles = project.the<SourceSetContainer>()["main"].output.classesDirs
+                val srcDirsSet  = project.the<SourceSetContainer>()["main"].allSource.srcDirs
+                val jacocoConfig = project.configurations.getByName("jacocoAnt")
+                doLast { writeJsonCoverage(jsonDir, extensions, classesFiles, srcDirsSet, jacocoConfig) }
+            } else {
+                finalizedBy("jacocoTestReport")
+            }
         }
     }
+}
+
+fun writeJsonCoverage(
+    jsonDir: String,
+    exts: org.gradle.api.plugins.ExtensionContainer,
+    classesFiles: org.gradle.api.file.FileCollection,
+    srcDirsSet: Set<java.io.File>,
+    jacocoConfig: org.gradle.api.artifacts.Configuration
+) {
+    val ext      = exts.findByType<JacocoTaskExtension>() ?: return
+    val execFile = ext.destinationFile ?: return
+    if (!execFile.exists()) return
+    val classesDirs = classesFiles.files.filter { it.exists() }
+    val srcDirs     = srcDirsSet.filter    { it.exists() }
+    val jacocoJars  = try { jacocoConfig.resolve() } catch (e: Exception) { return }
+    // null parent: isolate from daemon classpath to avoid version conflicts with JaCoCo already loaded by Gradle
+    val cl = java.net.URLClassLoader(jacocoJars.map { it.toURI().toURL() }.toTypedArray(), null)
+    try {
+        val loaderCls  = cl.loadClass("org.jacoco.core.tools.ExecFileLoader")
+        val loader     = loaderCls.getDeclaredConstructor().newInstance()
+        loaderCls.getMethod("load", java.io.File::class.java).invoke(loader, execFile)
+        val execStore  = loaderCls.getMethod("getExecutionDataStore").invoke(loader)
+        val builderCls = cl.loadClass("org.jacoco.core.analysis.CoverageBuilder")
+        val builder    = builderCls.getDeclaredConstructor().newInstance()
+        val analyzerCls = cl.loadClass("org.jacoco.core.analysis.Analyzer")
+        val analyzer    = analyzerCls.getConstructor(
+            cl.loadClass("org.jacoco.core.data.ExecutionDataStore"),
+            cl.loadClass("org.jacoco.core.analysis.ICoverageVisitor")
+        ).newInstance(execStore, builder)
+        for (dir in classesDirs) analyzerCls.getMethod("analyzeAll", java.io.File::class.java).invoke(analyzer, dir)
+        @Suppress("UNCHECKED_CAST")
+        val classes    = builderCls.getMethod("getClasses").invoke(builder) as Collection<Any>
+        val iLineCls   = cl.loadClass("org.jacoco.core.analysis.ILine")
+        val getStatus  = iLineCls.getMethod("getStatus")
+        val iClassCls  = cl.loadClass("org.jacoco.core.analysis.IClassCoverage")
+        val iSourceCls = cl.loadClass("org.jacoco.core.analysis.ISourceNode")
+        val mPkg    = iClassCls.getMethod("getPackageName")
+        val mSrc    = iClassCls.getMethod("getSourceFileName")
+        val mFirst  = iSourceCls.getMethod("getFirstLine")
+        val mLast   = iSourceCls.getMethod("getLastLine")
+        val mLine   = iSourceCls.getMethod("getLine", Int::class.java)
+        val result     = mutableMapOf<String, MutableSet<Int>>()
+        for (cls in classes) {
+            val pkg   = (mPkg.invoke(cls) as? String ?: "").replace('/', java.io.File.separatorChar)
+            val src   = mSrc.invoke(cls) as? String ?: continue
+            val first = mFirst.invoke(cls) as Int
+            val last  = mLast.invoke(cls) as Int
+            if (first < 0) continue
+            val absPath = srcDirs.map { java.io.File(it, "$pkg\${java.io.File.separator}$src") }
+                .firstOrNull { it.exists() }?.canonicalPath ?: continue
+            val lineList = result.getOrPut(absPath) { mutableSetOf() }
+            for (nr in first..last) {
+                val status = getStatus.invoke(mLine.invoke(cls, nr)) as Int
+                if (status >= 2) lineList.add(nr)
+            }
+        }
+        val sb = StringBuilder("{")
+        result.entries.forEachIndexed { i, (p, lines) ->
+            val sorted = lines.sorted()
+            if (i > 0) sb.append(',')
+            val escaped = p.replace("\\\\", "\\\\\\\\").replace(""""""", """\\"""""")
+            sb.append('"').append(escaped).append('"').append(':')
+               .append(sorted.joinToString(",", "[", "]"))
+        }
+        sb.append("}")
+        java.io.File(jsonDir).also { it.mkdirs() }.resolve("coverage-final.json").writeText(sb.toString())
+    } finally { cl.close() }
 }`;
 
 const INJECTION_BLOCK = `
@@ -33,7 +108,15 @@ allprojects {
         }
         testTask.outputs.upToDateWhen { false }
         testTask.jvmArgs("-XX:TieredStopAtLevel=1")
-        testTask.finalizedBy(reportTask)
+        val jsonDir = providers.gradleProperty("coverage.insights.jsonDir").orNull
+        if (jsonDir != null) {
+            val classesFiles = the<SourceSetContainer>()["main"].output.classesDirs
+            val srcDirsSet   = the<SourceSetContainer>()["main"].allSource.srcDirs
+            val jacocoConfig = configurations.getByName("jacocoAnt")
+            testTask.doLast { writeJsonCoverage(jsonDir, extensions, classesFiles, srcDirsSet, jacocoConfig) }
+        } else {
+            testTask.finalizedBy(reportTask)
+        }
     }
 }`;
 
