@@ -326,10 +326,7 @@ describe('gradleRunner.discover', () => {
     expect(cases[0].title).toBe('realTest');
   });
 
-  it('known limitation: abstract base @Test methods are discovered under the abstract class name, not concrete subclass', async () => {
-    // Gradle --tests filter requires the concrete class name (ConcreteSubTest.sharedTest),
-    // but we discover the test under the abstract class (BaseOrderUTest.sharedTest).
-    // This is a known gap: cross-file inheritance resolution is not implemented.
+  it('emits inherited @Test methods under the concrete subclass, not the abstract base', async () => {
     const root = path.join(tmpDir, 'project');
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
@@ -345,11 +342,80 @@ describe('gradleRunner.discover', () => {
       public class ConcreteSubTest extends AbstractBaseTest {}
     `);
     const cases = await gradleRunner.discover(root, undefined, undefined);
-    // sharedTest is found, but under the abstract class — not the runnable concrete one
+    // sharedTest should be emitted under the concrete class — that's what Gradle needs
     expect(cases.map(c => c.title)).toContain('sharedTest');
-    expect(cases.find(c => c.title === 'sharedTest')?.describePath).toBe('com.example.AbstractBaseTest');
-    // ConcreteSubTest has no @Test methods of its own, so no entry for it
-    expect(cases.every(c => c.describePath !== 'com.example.ConcreteSubTest')).toBe(true);
+    expect(cases.find(c => c.title === 'sharedTest')?.describePath).toBe('com.example.ConcreteSubTest');
+    // Abstract class should not be emitted directly when a concrete subclass exists
+    expect(cases.every(c => c.describePath !== 'com.example.AbstractBaseTest')).toBe(true);
+  });
+
+  it('handles multi-level inheritance chains', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'GrandparentTest', `
+      package com.example;
+      public abstract class GrandparentTest {
+        @Test public void grandparentTest() {}
+      }
+    `);
+    writeJavaTestFile(root, 'app', 'com.example', 'ParentTest', `
+      package com.example;
+      public abstract class ParentTest extends GrandparentTest {
+        @Test public void parentTest() {}
+      }
+    `);
+    writeJavaTestFile(root, 'app', 'com.example', 'ChildTest', `
+      package com.example;
+      public class ChildTest extends ParentTest {
+        @Test public void childTest() {}
+      }
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    const childCases = cases.filter(c => c.describePath === 'com.example.ChildTest');
+    expect(childCases.map(c => c.title)).toContain('childTest');
+    expect(childCases.map(c => c.title)).toContain('parentTest');
+    expect(childCases.map(c => c.title)).toContain('grandparentTest');
+    // Abstract classes not emitted directly
+    expect(cases.every(c => c.describePath !== 'com.example.GrandparentTest')).toBe(true);
+    expect(cases.every(c => c.describePath !== 'com.example.ParentTest')).toBe(true);
+  });
+
+  it('falls back to abstract class name when no concrete subclass is in the scan', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'StandaloneAbstractTest', `
+      package com.example;
+      public abstract class StandaloneAbstractTest {
+        @Test public void orphanTest() {}
+      }
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    // No concrete subclass scanned — emit under abstract as best-effort fallback
+    expect(cases.map(c => c.title)).toContain('orphanTest');
+    expect(cases.find(c => c.title === 'orphanTest')?.describePath).toBe('com.example.StandaloneAbstractTest');
+  });
+
+  it('resolves parent class from explicit import when in different package', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example.base', 'BaseTest', `
+      package com.example.base;
+      public abstract class BaseTest {
+        @Test public void baseMethod() {}
+      }
+    `);
+    writeJavaTestFile(root, 'app', 'com.example.impl', 'ImplTest', `
+      package com.example.impl;
+      import com.example.base.BaseTest;
+      public class ImplTest extends BaseTest {}
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    const impl = cases.filter(c => c.describePath === 'com.example.impl.ImplTest');
+    expect(impl.map(c => c.title)).toContain('baseMethod');
+    expect(cases.every(c => c.describePath !== 'com.example.base.BaseTest')).toBe(true);
   });
 
   it('caches session state — init script written only once across multiple calls', async () => {

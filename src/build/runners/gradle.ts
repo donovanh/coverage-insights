@@ -126,39 +126,128 @@ function findSourceFiles(dir: string, results: string[] = []): string[] {
   return results;
 }
 
-/** Parse @Test-annotated method names from a Java source file. */
-function parseJavaTestFile(content: string, modulePath: string): TestCase[] {
-  // Strip comments and string literals to avoid false positives from @Test references
-  // in Javadoc, inline comments, or string values.
+interface ParsedJavaClass {
+  fqcn:        string;
+  packageName: string;
+  isAbstract:  boolean;
+  extendsName: string | null;  // simple class name only
+  imports:     string[];       // fully-qualified import names
+  ownTests:    string[];       // @Test method names found directly in this file
+  modulePath:  string;
+}
+
+/** Parse structural information + @Test methods from a Java source file. */
+function parseJavaClass(content: string, modulePath: string): ParsedJavaClass | null {
+  // Strip comments and string literals to avoid false positives.
   const stripped = content
-    .replace(/\/\/[^\n]*/g, '')               // line comments
-    .replace(/\/\*[\s\S]*?\*\//g, '')          // block comments
-    .replace(/"(?:[^"\\]|\\.)*"/g, '""');      // string literals
+    .replace(/\/\/[^\n]*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""');
 
   const packageMatch = stripped.match(/^\s*package\s+([\w.]+)\s*;/m);
   const packageName  = packageMatch ? packageMatch[1] : '';
-  const classMatch   = stripped.match(/(?:public\s+|abstract\s+|final\s+)*class\s+(\w+)/);
-  if (!classMatch) return [];
-  const fqcn = packageName ? `${packageName}.${classMatch[1]}` : classMatch[1];
 
-  const testCases: TestCase[] = [];
-  // Split on @Test / @ParameterizedTest / @RepeatedTest (with optional params).
-  // Use \b so @TestMethodOrder etc. are not matched.
-  // [^)]* already crosses newlines — multi-line annotation params are handled.
+  // Capture class name
+  const classMatch = stripped.match(/(?:\w+\s+)*class\s+(\w+)/);
+  if (!classMatch) return null;
+  const simpleClass = classMatch[1];
+  // Check for 'abstract' anywhere in the class declaration (before the opening brace)
+  const classPos   = stripped.indexOf(classMatch[0]);
+  const bodyStart  = stripped.indexOf('{', classPos);
+  const header     = stripped.slice(Math.max(0, classPos - 50), bodyStart >= 0 ? bodyStart : classPos + 80);
+  const isAbstract = /\babstract\b/.test(header);
+  const fqcn          = packageName ? `${packageName}.${simpleClass}` : simpleClass;
+
+  // extends clause — allow it to be on a different line from `class`
+  const extendsMatch  = stripped.match(/\bclass\s+\w+[^{]*?\bextends\s+(\w+)/s);
+  const extendsName   = extendsMatch ? extendsMatch[1] : null;
+
+  // import statements
+  const imports: string[] = [];
+  for (const m of stripped.matchAll(/^\s*import\s+(?:static\s+)?([\w.]+)\s*;/gm))
+    imports.push(m[1]);
+
+  // @Test method names
+  const ownTests: string[] = [];
   const parts = stripped.split(/@(?:Test|ParameterizedTest|RepeatedTest)\b(?:\s*\([^)]*\))?/);
   for (let i = 1; i < parts.length; i++) {
     let text = parts[i];
-    // Strip other annotations between @Test and the method signature (e.g. @Ignore, @Override)
     text = text.replace(/@\w+(?:\s*\([^)]*\))?\s*/g, ' ');
-    // Strip access/type modifiers so the first remaining word(+paren) is the method name
     text = text.replace(/\b(?:public|protected|private|static|final|abstract|synchronized|native|strictfp|void)\b/g, ' ');
     const m = text.match(/\b(\w+)\s*\(/);
-    if (m && m[1] !== 'class' && m[1] !== 'new') {
+    if (m && m[1] !== 'class' && m[1] !== 'new') ownTests.push(m[1]);
+  }
+
+  return { fqcn, packageName, isAbstract, extendsName, imports, ownTests, modulePath };
+}
+
+/** Resolve simple parent class name to FQCN using imports + same-package fallback. */
+function resolveParentFqcn(child: ParsedJavaClass, simpleName: string): string | null {
+  const imported = child.imports.find(i => i === simpleName || i.endsWith(`.${simpleName}`));
+  if (imported) return imported;
+  return child.packageName ? `${child.packageName}.${simpleName}` : simpleName;
+}
+
+/** Collect all @Test titles reachable from fqcn, walking up the inheritance chain. */
+function collectAllTests(
+  fqcn: string,
+  byFqcn: Map<string, ParsedJavaClass>,
+  visited = new Set<string>(),
+): string[] {
+  if (visited.has(fqcn)) return [];
+  visited.add(fqcn);
+  const cls = byFqcn.get(fqcn);
+  if (!cls) return [];
+  const parentTests = cls.extendsName
+    ? collectAllTests(resolveParentFqcn(cls, cls.extendsName) ?? '', byFqcn, visited)
+    : [];
+  // Child overrides parent: deduplicate title-first (child wins)
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const t of [...cls.ownTests, ...parentTests]) {
+    if (!seen.has(t)) { seen.add(t); result.push(t); }
+  }
+  return result;
+}
+
+/** Resolve inheritance and emit TestCase[] for all parsed Java classes. */
+function resolveJavaTestCases(classes: ParsedJavaClass[]): TestCase[] {
+  const byFqcn = new Map(classes.map(c => [c.fqcn, c]));
+
+  // Track which abstract classes have at least one concrete subclass anywhere in the scan.
+  // Walk the full ancestor chain from each concrete class so grandparents are included.
+  const abstractsWithConcrete = new Set<string>();
+  for (const cls of classes) {
+    if (!cls.isAbstract) {
+      let current: ParsedJavaClass | undefined = cls;
+      const visited = new Set<string>();
+      while (current?.extendsName) {
+        const parentFqcn = resolveParentFqcn(current, current.extendsName);
+        if (!parentFqcn || visited.has(parentFqcn)) break;
+        visited.add(parentFqcn);
+        const parent = byFqcn.get(parentFqcn);
+        if (!parent) break;
+        abstractsWithConcrete.add(parentFqcn);
+        current = parent;
+      }
+    }
+  }
+
+  const testCases: TestCase[] = [];
+  for (const cls of classes) {
+    // Abstract classes whose tests will be emitted via concrete subclasses — skip directly
+    if (cls.isAbstract && abstractsWithConcrete.has(cls.fqcn)) continue;
+
+    const titles = cls.isAbstract
+      ? cls.ownTests  // fallback: abstract with no known concrete subclass
+      : collectAllTests(cls.fqcn, byFqcn);
+
+    for (const title of titles) {
       testCases.push({
-        filePath:    modulePath,
-        fullName:    `${fqcn} > ${m[1]}`,
-        title:       m[1],
-        describePath: fqcn,
+        filePath:    cls.modulePath,
+        fullName:    `${cls.fqcn} > ${title}`,
+        title,
+        describePath: cls.fqcn,
       });
     }
   }
@@ -278,17 +367,23 @@ export const gradleRunner: Runner = {
     ensureSession(projectRoot);
     const modules    = parseModules(projectRoot);
     const sourceDirs = findTestSourceDirs(projectRoot, modules);
-    const testCases: TestCase[] = [];
+    const testCases: TestCase[]        = [];
+    const javaClasses: ParsedJavaClass[] = [];
+
     for (const { dir, modulePath } of sourceDirs) {
       for (const file of findSourceFiles(dir)) {
         if (fileFilter && !modulePath.includes(fileFilter) && !file.includes(fileFilter)) continue;
         const content = fs.readFileSync(file, 'utf8');
-        const parsed  = file.endsWith('.kt')
-          ? parseKotlinTestFile(content, modulePath)
-          : parseJavaTestFile(content, modulePath);
-        testCases.push(...parsed);
+        if (file.endsWith('.kt')) {
+          testCases.push(...parseKotlinTestFile(content, modulePath));
+        } else {
+          const parsed = parseJavaClass(content, modulePath);
+          if (parsed) javaClasses.push(parsed);
+        }
       }
     }
+
+    testCases.push(...resolveJavaTestCases(javaClasses));
     return testCases;
   },
 
