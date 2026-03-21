@@ -9,11 +9,13 @@ allprojects {
             if (baseDir != null) {
                 reports {
                     xml.required.set(true)
-                    xml.outputLocation.set(file("\$baseDir/\${project.path.trimStart(':').replace(':', '/')}/jacoco.xml"))
+                    xml.outputLocation.set(file("$baseDir/\${project.path.trimStart(':').replace(':', '/')}/jacoco.xml"))
                 }
             }
         }
         tasks.withType<Test> {
+            outputs.upToDateWhen { false }
+            jvmArgs("-XX:TieredStopAtLevel=1")
             finalizedBy("jacocoTestReport")
         }
     }
@@ -29,6 +31,8 @@ allprojects {
             executionData(testTask)
             sourceSets(the<SourceSetContainer>()["main"])
         }
+        testTask.outputs.upToDateWhen { false }
+        testTask.jvmArgs("-XX:TieredStopAtLevel=1")
         testTask.finalizedBy(reportTask)
     }
 }`;

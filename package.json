@@ -45,6 +45,7 @@
     "@types/jest": "^29",
     "@types/node": "^20.0.0",
     "@vitest/coverage-istanbul": "^4.1.0",
+    "@vitest/coverage-v8": "4.1.0",
     "babel-jest": "^29",
     "eslint": "^9",
     "eslint-config-prettier": "^9",

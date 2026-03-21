@@ -37,8 +37,7 @@ function escapeTestName(name: string): string {
 // Note: parentheses in parameterised test names (e.g. myTest(param)) are not escaped
 // — Gradle may match the whole test class in those cases, which is an acceptable over-approximation.
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', entityExpansionLimit: Number.MAX_SAFE_INTEGER } as any);
+const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', processEntities: { maxTotalExpansions: Number.MAX_SAFE_INTEGER } });
 
 interface SuiteXml {
   testsuite?: {
@@ -410,7 +409,6 @@ export const gradleRunner: Runner = {
       `${taskPrefix}test`,
       '--tests', testFilter,
       '--daemon',
-      '--rerun-tasks',
       `--project-cache-dir=${_daemonCacheDir}`,
       '--init-script', initScript,
       `-Pcoverage.insights.xmlDir=${workerDir}`,

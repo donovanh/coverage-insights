@@ -23,9 +23,7 @@ interface JacocoPackage {
 }
 interface JacocoReport { report?: { package?: JacocoPackage | JacocoPackage[] } }
 
-// entityExpansionLimit exists at runtime but is missing from v5 type definitions
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', entityExpansionLimit: Number.MAX_SAFE_INTEGER } as any);
+const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', processEntities: { maxTotalExpansions: Number.MAX_SAFE_INTEGER } });
 
 /** Resolve absolute path for a JaCoCo source file entry. Falls back to relative path. */
 function resolveSourcePath(pkgName: string, filename: string, modulePath: string): string {
