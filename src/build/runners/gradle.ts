@@ -5,7 +5,7 @@ import path from 'path';
 import { XMLParser } from 'fast-xml-parser';
 import type { Runner, TestCase } from '../index.js';
 import { parseModules, moduleToPath, pathToModule, findGradleCommand } from './gradle/settings.js';
-import { parseJacocoXml, mergeIstanbulMaps, extractCoveredLines } from './gradle/jacoco.js';
+import { parseJacocoXml, mergeIstanbulMaps } from './gradle/jacoco.js';
 import { generateInitScript, detectJacoco } from './gradle/init-script.js';
 
 // Session state — initialised lazily by whichever method is called first
@@ -343,23 +343,6 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
   fs.writeFileSync(path.join(dir, 'coverage-final.json'), JSON.stringify(merged), 'utf8');
 }
 
-/** Compact line-only extraction — used by runOne() to skip the Istanbul intermediate. */
-function mergeLinesFromJacocoDir(dir: string, projectRoot: string): void {
-  const xmlFiles = scanJacocoXml(dir);
-  const merged: Record<string, number[]> = {};
-
-  for (const f of xmlFiles) {
-    const moduleRelPath = path.relative(dir, path.dirname(f));
-    const realModulePath = path.join(projectRoot, moduleRelPath);
-    const lines = extractCoveredLines(fs.readFileSync(f, 'utf8'), realModulePath);
-    for (const [absPath, lineNums] of Object.entries(lines)) {
-      if (!merged[absPath]) { merged[absPath] = lineNums; continue; }
-      for (const n of lineNums) if (!merged[absPath].includes(n)) merged[absPath].push(n);
-    }
-  }
-  for (const key of Object.keys(merged)) merged[key].sort((a, b) => a - b);
-  fs.writeFileSync(path.join(dir, 'coverage-final.json'), JSON.stringify(merged), 'utf8');
-}
 
 export const gradleRunner: Runner = {
   // Gradle incurs JVM startup overhead per test; keep concurrency low by default.
@@ -404,14 +387,13 @@ export const gradleRunner: Runner = {
     const testFilter = escapeTestName(`${tc.describePath}.${tc.title}`);
 
     const taskPrefix = gradleModule ? `${gradleModule}:` : '';
-    // Single invocation: jacocoTestReport runs automatically via finalizedBy wired in the init script.
     const testArgs = [
       `${taskPrefix}test`,
       '--tests', testFilter,
       '--daemon',
       `--project-cache-dir=${_daemonCacheDir}`,
       '--init-script', initScript,
-      `-Pcoverage.insights.xmlDir=${workerDir}`,
+      `-Pcoverage.insights.jsonDir=${workerDir}`,
     ];
 
     await new Promise<void>((resolve, reject) => {
@@ -420,8 +402,12 @@ export const gradleRunner: Runner = {
       });
     });
 
-    // Convert JaCoCo XML(s) in workerDir to compact coverage-final.json (lines only).
-    mergeLinesFromJacocoDir(workerDir, projectRoot);
+    // Gradle's doLast writes coverage-final.json directly to workerDir.
+    // If it didn't (no exec data / agent not triggered), write empty fallback.
+    const coverageJson = path.join(workerDir, 'coverage-final.json');
+    if (!fs.existsSync(coverageJson)) {
+      fs.writeFileSync(coverageJson, '{}', 'utf8');
+    }
   },
 
   async aggregate(projectRoot, aggregateDir, _configPath) {
