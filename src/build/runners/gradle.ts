@@ -11,11 +11,13 @@ import { generateInitScript, detectJacoco } from './gradle/init-script.js';
 // Session state — initialised lazily by whichever method is called first
 let _gradleCmd: string | undefined;
 let _initScriptPath: string | undefined;
+let _daemonCacheDir: string | undefined;
 
 /** For testing only — reset session state between tests. */
 export function _resetSession(): void {
   _gradleCmd = undefined;
   _initScriptPath = undefined;
+  _daemonCacheDir = undefined;
 }
 
 function ensureSession(projectRoot: string): void {
@@ -26,6 +28,7 @@ function ensureSession(projectRoot: string): void {
   const script = generateInitScript(needsInjection);
   _initScriptPath = path.join(os.tmpdir(), `coverage-insights-${process.pid}.init.gradle.kts`);
   fs.writeFileSync(_initScriptPath, script, 'utf8');
+  _daemonCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'coverage-insights-gradle-'));
 }
 
 function escapeTestName(name: string): string {
@@ -402,31 +405,19 @@ export const gradleRunner: Runner = {
     const testFilter = escapeTestName(`${tc.describePath}.${tc.title}`);
 
     const taskPrefix = gradleModule ? `${gradleModule}:` : '';
-    // Run test and jacocoTestReport in separate invocations because --tests is
-    // a Test-task-specific option and Gradle rejects it when applied to jacocoTestReport.
-    const commonArgs = [
-      '--no-daemon',
-      '--rerun-tasks',
-      '--init-script', initScript,
-      `-Pcoverage.insights.xmlDir=${workerDir}`,
-    ];
+    // Single invocation: jacocoTestReport runs automatically via finalizedBy wired in the init script.
     const testArgs = [
       `${taskPrefix}test`,
       '--tests', testFilter,
-      ...commonArgs,
-    ];
-    const reportArgs = [
-      `${taskPrefix}jacocoTestReport`,
-      ...commonArgs,
+      '--daemon',
+      '--rerun-tasks',
+      `--project-cache-dir=${_daemonCacheDir}`,
+      '--init-script', initScript,
+      `-Pcoverage.insights.xmlDir=${workerDir}`,
     ];
 
     await new Promise<void>((resolve, reject) => {
       execFile(gradleCmd, testArgs, { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, err => {
-        if (err) reject(err); else resolve();
-      });
-    });
-    await new Promise<void>((resolve, reject) => {
-      execFile(gradleCmd, reportArgs, { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, err => {
         if (err) reject(err); else resolve();
       });
     });
@@ -447,8 +438,9 @@ export const gradleRunner: Runner = {
       execFileSync(gradleCmd, [
         'test', 'jacocoTestReport',
         '--continue',
-        '--no-daemon',
+        '--daemon',
         '--rerun-tasks',
+        `--project-cache-dir=${_daemonCacheDir}`,
         '--init-script', initScript,
         `-Pcoverage.insights.xmlDir=${aggregateDir}`,
       ], { cwd: projectRoot, encoding: 'utf8', stdio: 'pipe' });
@@ -456,9 +448,15 @@ export const gradleRunner: Runner = {
 
     mergeJacocoDir(aggregateDir, projectRoot);
 
-    // Kill any stray daemons from previous runs as a safety net. Best-effort.
+    // Stop daemons and clean up the session cache dir.
     try {
-      execFileSync(gradleCmd, ['--stop'], { cwd: projectRoot, encoding: 'utf8', stdio: 'pipe' });
+      execFileSync(gradleCmd, ['--stop', `--project-cache-dir=${_daemonCacheDir}`], {
+        cwd: projectRoot, encoding: 'utf8', stdio: 'pipe',
+      });
     } catch { /* ignore */ }
+    if (_daemonCacheDir) {
+      fs.rmSync(_daemonCacheDir, { recursive: true, force: true });
+      _daemonCacheDir = undefined;
+    }
   },
 };

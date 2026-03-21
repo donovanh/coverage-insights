@@ -13,6 +13,9 @@ allprojects {
                 }
             }
         }
+        tasks.withType<Test> {
+            finalizedBy("jacocoTestReport")
+        }
     }
 }`;
 
