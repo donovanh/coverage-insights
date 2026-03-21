@@ -82,7 +82,7 @@ export function htmlReport(report: AnalysisReport, opts: AnalysisOptions = {}): 
 
   const itEachCount   = consolidationGroups.filter(g => g.suggestion === 'it.each').length;
   const mergeCount    = consolidationGroups.filter(g => g.suggestion === 'merge-assertions').length;
-  const consolidationTestTotal = consolidationGroups.reduce((n, g) => n + g.tests.length, 0);
+  const _consolidationTestTotal = consolidationGroups.reduce((n, g) => n + g.tests.length, 0);
 
   type OverlapAction = 'delete a?' | 'delete b?' | 'investigate';
   function overlapAction(p: typeof partialOverlapPairs[0]): OverlapAction {

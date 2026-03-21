@@ -152,7 +152,7 @@ async function runToolingApi(tests: typeof TESTS): Promise<number[]> {
   // Wait for the sidecar to signal it's ready
   await new Promise<void>((resolve, reject) => {
     const rl = readline.createInterface({ input: sidecar.stdout! });
-    rl.once('line', line => { rl.close(); line === 'ready' ? resolve() : reject(new Error(`Bad ready: ${line}`)); });
+    rl.once('line', line => { rl.close(); if (line === 'ready') resolve(); else reject(new Error(`Bad ready: ${line}`)); });
     sidecar.once('error', reject);
   });
 

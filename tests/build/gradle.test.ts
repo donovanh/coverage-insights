@@ -27,12 +27,6 @@ const SUREFIRE_JUNIT = `<?xml version="1.0" encoding="UTF-8"?>
   </testcase>
 </testsuite>`;
 
-// Minimal Surefire XML for a KoTest spec
-const SUREFIRE_KOTEST = `<?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.example.CalculatorSpec" tests="1">
-  <testcase name="Calculator - should add two numbers" classname="com.example.CalculatorSpec" time="0.2"/>
-</testsuite>`;
-
 // Minimal JaCoCo XML
 const JACOCO_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <report name="test">

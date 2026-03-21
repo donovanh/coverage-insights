@@ -2,7 +2,6 @@ import { execFileSync, execFile } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { XMLParser } from 'fast-xml-parser';
 import type { Runner, TestCase } from '../index.js';
 import { parseModules, moduleToPath, pathToModule, findGradleCommand } from './gradle/settings.js';
 import { parseJacocoXml, mergeIstanbulMaps } from './gradle/jacoco.js';
@@ -36,59 +35,6 @@ function escapeTestName(name: string): string {
 }
 // Note: parentheses in parameterised test names (e.g. myTest(param)) are not escaped
 // — Gradle may match the whole test class in those cases, which is an acceptable over-approximation.
-
-const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', processEntities: { maxTotalExpansions: Number.MAX_SAFE_INTEGER } });
-
-interface SuiteXml {
-  testsuite?: {
-    '@_name': string;
-    testcase?: TestcaseXml | TestcaseXml[];
-  };
-}
-interface TestcaseXml {
-  '@_name': string;
-  '@_classname'?: string;
-  skipped?: unknown;
-}
-
-function parseSurefireXml(content: string, modulePath: string): TestCase[] {
-  const doc = xmlParser.parse(content) as SuiteXml;
-  const suite = doc.testsuite;
-  if (!suite) return [];
-  const className = suite['@_name'];
-  const raw = suite.testcase;
-  const cases = raw ? (Array.isArray(raw) ? raw : [raw]) : [];
-  return cases
-    .filter(tc => tc.skipped === undefined)
-    .map(tc => {
-      // JUnit 5 appends "()" to method names in Surefire XML (e.g. "should format date()").
-      // Gradle's --tests filter does not accept the trailing parens, so strip them here.
-      const rawName = tc['@_name'];
-      const title = rawName.endsWith('()') ? rawName.slice(0, -2) : rawName;
-      return {
-        filePath:    modulePath,
-        fullName:    `${tc['@_classname'] ?? className} > ${title}`,
-        title,
-        describePath: tc['@_classname'] ?? className,
-      };
-    });
-}
-
-function findSurefireXml(dir: string): string[] {
-  const results: string[] = [];
-  try {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory() && entry.name !== '.gradle' && entry.name !== '.git') {
-        results.push(...findSurefireXml(full));
-      } else if (entry.isFile() && entry.name.startsWith('TEST-') && entry.name.endsWith('.xml')
-        && dir.includes(path.join('build', 'test-results'))) {
-        results.push(full);
-      }
-    }
-  } catch { /* ignore unreadable dirs */ }
-  return results;
-}
 
 /** Return all test source directories for the project and its submodules. */
 function findTestSourceDirs(

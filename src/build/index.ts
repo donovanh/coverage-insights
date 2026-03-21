@@ -85,6 +85,31 @@ function buildCoverageSummary(coverageFinal: Record<string, unknown>): CoverageS
 
 const CPU_CONCURRENCY = Math.max(1, Math.min(Math.floor(os.cpus().length / 2), 10));
 
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+function startAggregateSpinner(isTTY: boolean): () => void {
+  if (!isTTY) {
+    process.stderr.write('  Running aggregate coverage pass...\n');
+    return () => {};
+  }
+  const start = Date.now();
+  let frame = 0;
+  const write = () => {
+    const secs = Math.round((Date.now() - start) / 1000);
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    const t = m > 0 ? `${m}m ${s}s` : `${s}s`;
+    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Aggregate coverage pass... ${t} elapsed`.padEnd(80));
+    frame++;
+  };
+  write();
+  const timer = setInterval(write, 100);
+  return () => {
+    clearInterval(timer);
+    process.stderr.write(`\r${' '.repeat(80)}\r`);
+  };
+}
+
 export async function build(opts: BuildOptions, runner: Runner): Promise<BuildResult> {
   const defaultConcurrency = runner.defaultConcurrency ?? CPU_CONCURRENCY;
   const { projectRoot, outDir, concurrency = defaultConcurrency, fileFilter, configPath } = opts;
@@ -156,12 +181,12 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
   clearProgress();
   // Remove per-test worker directories now that coverage data has been extracted into map.
   fs.rmSync(tmpRoot, { recursive: true, force: true });
-  if (process.stderr.isTTY) process.stderr.write(`  Per-test runs complete. Running aggregate coverage pass...\n`);
-
   // ── Step 3: Aggregate ────────────────────────────────────────────────────────
   const aggregateDir = path.join(outDir, 'aggregate');
   let summary: CoverageSummary = {};
+  const stopSpinner = startAggregateSpinner(isTTY);
   await runner.aggregate(projectRoot, aggregateDir, configPath);
+  stopSpinner();
   const aggregatePath = path.join(aggregateDir, 'coverage-final.json');
   if (fs.existsSync(aggregatePath)) {
     summary = buildCoverageSummary(JSON.parse(fs.readFileSync(aggregatePath, 'utf8')) as Record<string, unknown>);
