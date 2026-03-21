@@ -28,7 +28,7 @@ const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_
 /** Resolve absolute path for a JaCoCo source file entry. Falls back to relative path. */
 function resolveSourcePath(pkgName: string, filename: string, modulePath: string): string {
   const rel = pkgName + '/' + filename;
-  for (const srcDir of ['src/main/kotlin', 'src/main/java', 'src/main']) {
+  for (const srcDir of ['src/main/kotlin', 'src/main/java', 'src/main', 'app']) {
     const candidate = path.join(modulePath, srcDir, rel);
     if (fs.existsSync(candidate)) return candidate;
   }

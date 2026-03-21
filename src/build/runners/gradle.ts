@@ -386,14 +386,16 @@ export const gradleRunner: Runner = {
     const gradleModule = pathToModule(tc.filePath as string, projectRoot);
     const testFilter = escapeTestName(`${tc.describePath}.${tc.title}`);
 
-    const taskPrefix = gradleModule ? `${gradleModule}:` : '';
+    // Use ':' prefix for root project to scope to root only — without it, Gradle
+    // applies --tests to all submodule test tasks too, which fail with "No tests found".
+    const taskPrefix = gradleModule ? `${gradleModule}:` : ':';
     const testArgs = [
       `${taskPrefix}test`,
       '--tests', testFilter,
       '--daemon',
       `--project-cache-dir=${_daemonCacheDir}`,
       '--init-script', initScript,
-      `-Pcoverage.insights.jsonDir=${workerDir}`,
+      `-Pcoverage.insights.xmlDir=${workerDir}`,
     ];
 
     await new Promise<void>((resolve, reject) => {
@@ -402,12 +404,8 @@ export const gradleRunner: Runner = {
       });
     });
 
-    // Gradle's doLast writes coverage-final.json directly to workerDir.
-    // If it didn't (no exec data / agent not triggered), write empty fallback.
-    const coverageJson = path.join(workerDir, 'coverage-final.json');
-    if (!fs.existsSync(coverageJson)) {
-      fs.writeFileSync(coverageJson, '{}', 'utf8');
-    }
+    // Convert JaCoCo XML(s) produced by jacocoTestReport into coverage-final.json.
+    mergeJacocoDir(workerDir, projectRoot);
   },
 
   async aggregate(projectRoot, aggregateDir, _configPath) {

@@ -445,6 +445,7 @@ describe('gradleRunner.runOne', () => {
     fs.mkdirSync(root);
     fs.mkdirSync(workerDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+    writeJacocoXml(workerDir, 'application', JACOCO_XML);
 
     const tc = {
       filePath: path.join(root, 'application'),
@@ -463,6 +464,7 @@ describe('gradleRunner.runOne', () => {
     fs.mkdirSync(root);
     fs.mkdirSync(workerDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+    writeJacocoXml(workerDir, 'application', JACOCO_XML);
 
     const tc = {
       filePath: path.join(root, 'application'),
@@ -486,6 +488,7 @@ describe('gradleRunner.runOne', () => {
     fs.mkdirSync(root);
     fs.mkdirSync(workerDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+    writeJacocoXml(workerDir, 'application', JACOCO_XML);
 
     const tc = {
       filePath: path.join(root, 'application'),
@@ -500,12 +503,13 @@ describe('gradleRunner.runOne', () => {
     expect(args[testsIdx + 1]).toContain('\\*');
   });
 
-  it('passes -Pcoverage.insights.jsonDir to gradle', async () => {
+  it('passes -Pcoverage.insights.xmlDir to gradle', async () => {
     const root = path.join(tmpDir, 'project');
     const workerDir = path.join(tmpDir, 'worker-0');
     fs.mkdirSync(root);
     fs.mkdirSync(workerDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+    writeJacocoXml(workerDir, 'application', JACOCO_XML);
 
     const tc = {
       filePath: path.join(root, 'application'),
@@ -517,16 +521,17 @@ describe('gradleRunner.runOne', () => {
     await gradleRunner.runOne(tc, root, workerDir, undefined);
 
     const args = mockExecFile.mock.calls[0][1] as string[];
-    expect(args.some(a => a.startsWith('-Pcoverage.insights.jsonDir='))).toBe(true);
-    expect(args.every(a => !a.startsWith('-Pcoverage.insights.xmlDir='))).toBe(true);
+    expect(args.some(a => a.startsWith('-Pcoverage.insights.xmlDir='))).toBe(true);
+    expect(args.every(a => !a.startsWith('-Pcoverage.insights.jsonDir='))).toBe(true);
   });
 
-  it('writes empty coverage-final.json when gradle writes nothing', async () => {
+  it('writes empty coverage-final.json when no jacoco XML produced', async () => {
     const root = path.join(tmpDir, 'project');
     const workerDir = path.join(tmpDir, 'worker-0');
     fs.mkdirSync(root);
     fs.mkdirSync(workerDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+    // No XML written — simulates test with no coverage data
 
     const tc = {
       filePath: path.join(root, 'application'),
@@ -540,35 +545,26 @@ describe('gradleRunner.runOne', () => {
     expect(json).toBe('{}');
   });
 
-  it('preserves coverage-final.json written by gradle', async () => {
+  it('uses : prefix for root-project tests to avoid running submodule test tasks', async () => {
     const root = path.join(tmpDir, 'project');
     const workerDir = path.join(tmpDir, 'worker-0');
     fs.mkdirSync(root);
     fs.mkdirSync(workerDir, { recursive: true });
-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-    const expected = JSON.stringify({ '/src/Foo.java': [5, 6] });
-
-    // Simulate Gradle writing coverage-final.json during execFile (after workerDir is cleaned by runOne)
-    mockExecFile.mockImplementationOnce((_p, _a, _o, cb) => {
-      setImmediate(() => {
-        fs.mkdirSync(workerDir, { recursive: true });
-        fs.writeFileSync(path.join(workerDir, 'coverage-final.json'), expected);
-        (cb as (e: null) => void)(null);
-      });
-      return undefined as unknown as ReturnType<typeof execFile>;
-    });
+    // No settings.gradle.kts — root project, no submodules
+    writeJacocoXml(workerDir, '', JACOCO_XML);
 
     const tc = {
-      filePath: path.join(root, 'application'),
+      filePath: root,  // filePath is the root — pathToModule returns ''
       fullName: 'com.example.FormatterTest > shouldFormatDate',
       title: 'shouldFormatDate',
       describePath: 'com.example.FormatterTest',
     };
 
     await gradleRunner.runOne(tc, root, workerDir, undefined);
-    const json = fs.readFileSync(path.join(workerDir, 'coverage-final.json'), 'utf8');
-    expect(json).toBe(expected);
+    const args = mockExecFile.mock.calls[0][1] as string[];
+    expect(args[0]).toBe(':test');  // ':test' not 'test'
   });
+
 });
 
 describe('generateInitScript', () => {
