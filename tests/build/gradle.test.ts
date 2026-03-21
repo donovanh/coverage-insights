@@ -182,6 +182,176 @@ describe('gradleRunner.discover', () => {
     expect(cases.some(c => String(c.filePath).includes('application'))).toBe(false);
   });
 
+  // ── Java annotation edge cases ──────────────────────────────────────────────
+
+  it('handles @Test(expected = ...) with annotation params', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'ExpectedExceptionTest', `
+      package com.example;
+      public class ExpectedExceptionTest {
+        @Test(expected = IllegalArgumentException.class)
+        public void throwsOnNull() {}
+
+        @Test (expected = SomeException.class)
+        public void throwsOnInvalid() {}
+
+        @Test()
+        public void emptyParens() {}
+
+        @Test(expected = X.class, timeout = 1000)
+        public void multipleParams() {}
+      }
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    expect(cases.map(c => c.title)).toContain('throwsOnNull');
+    expect(cases.map(c => c.title)).toContain('throwsOnInvalid');
+    expect(cases.map(c => c.title)).toContain('emptyParens');
+    expect(cases.map(c => c.title)).toContain('multipleParams');
+  });
+
+  it('handles multi-line annotation params', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'MultiLineTest', `
+      package com.example;
+      public class MultiLineTest {
+        @Test(
+          expected = IllegalArgumentException.class
+        )
+        public void multiLineAnnotation() {}
+      }
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    expect(cases.map(c => c.title)).toContain('multiLineAnnotation');
+  });
+
+  it('handles @Test and method declaration on the same line', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'SameLineTest', `
+      package com.example;
+      public class SameLineTest {
+        @Test public void testAddKeyOrder() {}
+        @Test public void testRemoveKeyOrder() {}
+      }
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    expect(cases.map(c => c.title)).toContain('testAddKeyOrder');
+    expect(cases.map(c => c.title)).toContain('testRemoveKeyOrder');
+  });
+
+  it('handles @Test with a following @Ignore annotation before the method', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'ComboAnnotationTest', `
+      package com.example;
+      public class ComboAnnotationTest {
+        @Test @Ignore("flaky: BOPS-212")
+        public void testSomething() {}
+
+        @Test
+        @Override
+        public void testOverride() {}
+      }
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    expect(cases.map(c => c.title)).toContain('testSomething');
+    expect(cases.map(c => c.title)).toContain('testOverride');
+  });
+
+  it('does not emit false positives for @Test in line comments', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'CommentedOutTest', `
+      package com.example;
+      public class CommentedOutTest {
+        // @Test - this used to be a test
+        public void formerTest() {}
+
+        @Test
+        public void realTest() {}
+      }
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    expect(cases.map(c => c.title)).toContain('realTest');
+    expect(cases.map(c => c.title)).not.toContain('formerTest');
+  });
+
+  it('does not emit false positives for @Test in block comments', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'BlockCommentTest', `
+      package com.example;
+      public class BlockCommentTest {
+        /* @Test */
+        public void alsoFormerTest() {}
+
+        /**
+         * @Test was previously used here
+         */
+        public void javadocTest() {}
+
+        @Test
+        public void realTest() {}
+      }
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    expect(cases.map(c => c.title)).toContain('realTest');
+    expect(cases.map(c => c.title)).not.toContain('alsoFormerTest');
+    expect(cases.map(c => c.title)).not.toContain('javadocTest');
+  });
+
+  it('does not emit false positives for @Test in string literals', async () => {
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'StringLiteralTest', `
+      package com.example;
+      public class StringLiteralTest {
+        @Test
+        public void realTest() {
+          String s = "@Test annotation example";
+        }
+      }
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    expect(cases).toHaveLength(1);
+    expect(cases[0].title).toBe('realTest');
+  });
+
+  it('known limitation: abstract base @Test methods are discovered under the abstract class name, not concrete subclass', async () => {
+    // Gradle --tests filter requires the concrete class name (ConcreteSubTest.sharedTest),
+    // but we discover the test under the abstract class (BaseOrderUTest.sharedTest).
+    // This is a known gap: cross-file inheritance resolution is not implemented.
+    const root = path.join(tmpDir, 'project');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":app")');
+    writeJavaTestFile(root, 'app', 'com.example', 'AbstractBaseTest', `
+      package com.example;
+      public abstract class AbstractBaseTest {
+        @Test
+        public void sharedTest() {}
+      }
+    `);
+    writeJavaTestFile(root, 'app', 'com.example', 'ConcreteSubTest', `
+      package com.example;
+      public class ConcreteSubTest extends AbstractBaseTest {}
+    `);
+    const cases = await gradleRunner.discover(root, undefined, undefined);
+    // sharedTest is found, but under the abstract class — not the runnable concrete one
+    expect(cases.map(c => c.title)).toContain('sharedTest');
+    expect(cases.find(c => c.title === 'sharedTest')?.describePath).toBe('com.example.AbstractBaseTest');
+    // ConcreteSubTest has no @Test methods of its own, so no entry for it
+    expect(cases.every(c => c.describePath !== 'com.example.ConcreteSubTest')).toBe(true);
+  });
+
   it('caches session state — init script written only once across multiple calls', async () => {
     const root = path.join(tmpDir, 'project');
     fs.mkdirSync(root);

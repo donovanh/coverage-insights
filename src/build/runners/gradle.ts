@@ -128,19 +128,27 @@ function findSourceFiles(dir: string, results: string[] = []): string[] {
 
 /** Parse @Test-annotated method names from a Java source file. */
 function parseJavaTestFile(content: string, modulePath: string): TestCase[] {
-  const packageMatch = content.match(/^\s*package\s+([\w.]+)\s*;/m);
+  // Strip comments and string literals to avoid false positives from @Test references
+  // in Javadoc, inline comments, or string values.
+  const stripped = content
+    .replace(/\/\/[^\n]*/g, '')               // line comments
+    .replace(/\/\*[\s\S]*?\*\//g, '')          // block comments
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""');      // string literals
+
+  const packageMatch = stripped.match(/^\s*package\s+([\w.]+)\s*;/m);
   const packageName  = packageMatch ? packageMatch[1] : '';
-  const classMatch   = content.match(/(?:public\s+|abstract\s+|final\s+)*class\s+(\w+)/);
+  const classMatch   = stripped.match(/(?:public\s+|abstract\s+|final\s+)*class\s+(\w+)/);
   if (!classMatch) return [];
   const fqcn = packageName ? `${packageName}.${classMatch[1]}` : classMatch[1];
 
   const testCases: TestCase[] = [];
   // Split on @Test / @ParameterizedTest / @RepeatedTest (with optional params).
   // Use \b so @TestMethodOrder etc. are not matched.
-  const parts = content.split(/@(?:Test|ParameterizedTest|RepeatedTest)\b(?:\s*\([^)]*\))?/);
+  // [^)]* already crosses newlines — multi-line annotation params are handled.
+  const parts = stripped.split(/@(?:Test|ParameterizedTest|RepeatedTest)\b(?:\s*\([^)]*\))?/);
   for (let i = 1; i < parts.length; i++) {
     let text = parts[i];
-    // Strip other annotations that may appear between @Test and the method signature
+    // Strip other annotations between @Test and the method signature (e.g. @Ignore, @Override)
     text = text.replace(/@\w+(?:\s*\([^)]*\))?\s*/g, ' ');
     // Strip access/type modifiers so the first remaining word(+paren) is the method name
     text = text.replace(/\b(?:public|protected|private|static|final|abstract|synchronized|native|strictfp|void)\b/g, ' ');
