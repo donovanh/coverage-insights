@@ -6,6 +6,7 @@ import type { Runner, TestCase } from '../index.js';
 import { parseModules, moduleToPath, pathToModule, findGradleCommand } from './gradle/settings.js';
 import { parseJacocoXml, mergeIstanbulMaps } from './gradle/jacoco.js';
 import { generateInitScript, detectJacoco } from './gradle/init-script.js';
+import { ensureListenerJar } from '../../setup/gradle-listener.js';
 
 // Session state — initialised lazily by whichever method is called first
 let _gradleCmd: string | undefined;
@@ -355,6 +356,37 @@ export const gradleRunner: Runner = {
 
     // Convert JaCoCo XML(s) produced by jacocoTestReport into coverage-final.json.
     mergeJacocoDir(workerDir, projectRoot);
+  },
+
+  async runAll(projectRoot, workDir) {
+    ensureSession(projectRoot);
+    const gradleCmd = _gradleCmd!;
+    const initScript = _initScriptPath!;
+    fs.mkdirSync(workDir, { recursive: true });
+    const listenerJar = ensureListenerJar(projectRoot);
+
+    // Single test invocation — listener dumps .exec per test
+    await new Promise<void>(resolve => {
+      execFile(gradleCmd, [
+        'test',
+        '--no-daemon',
+        '--init-script', initScript,
+        `-Pcoverage.insights.pertest.dir=${workDir}`,
+        `-Pcoverage.insights.listener.jar=${listenerJar}`,
+      ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, () => resolve());  // swallow errors — test failures OK
+    });
+
+    // Batch conversion — reads .exec files, writes coverage-final.json
+    await new Promise<void>((resolve, reject) => {
+      execFile(gradleCmd, [
+        'coverageInsightsBatchReport',
+        '--no-daemon',
+        '--init-script', initScript,
+        `-Pcoverage.insights.pertest.dir=${workDir}`,
+      ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, err => {
+        if (err) reject(err); else resolve();
+      });
+    });
   },
 
   async aggregate(projectRoot, aggregateDir, _configPath) {

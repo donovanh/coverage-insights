@@ -24,6 +24,31 @@ describe('generateInitScript', () => {
   it('injection variant wires finalizedBy', () => {
     expect(generateInitScript(true)).toContain('finalizedBy');
   });
+
+  it('includes listener JAR classpath wiring when pertest.dir property is present', () => {
+    const script = generateInitScript(false);
+    expect(script).toContain('coverage.insights.pertest.dir');
+    expect(script).toContain('classpath += files(listenerJar)');
+    expect(script).toContain('systemProperty("coverage.insights.pertest.dir"');
+  });
+
+  it('registers coverageInsightsBatchReport task when pertest.dir property is present', () => {
+    const script = generateInitScript(false);
+    expect(script).toContain('coverageInsightsBatchReport');
+    expect(script).toContain('batchConvert(');
+  });
+
+  it('injection variant also includes pertest support', () => {
+    const script = generateInitScript(true);
+    expect(script).toContain('coverage.insights.pertest.dir');
+    expect(script).toContain('classpath += files(listenerJar)');
+    expect(script).toContain('coverageInsightsBatchReport');
+  });
+
+  it('without pertest property, existing behaviour includes finalizedBy', () => {
+    const script = generateInitScript(false);
+    expect(script).toContain('finalizedBy("jacocoTestReport")');
+  });
 });
 
 describe('detectJacoco', () => {

@@ -22,6 +22,8 @@ export interface Runner {
   discover(projectRoot: string, fileFilter: string | undefined, configPath: string | undefined): Promise<TestCase[]>;
   runOne(tc: TestCase, projectRoot: string, workerDir: string, configPath: string | undefined): Promise<void>;
   aggregate(projectRoot: string, aggregateDir: string, configPath: string | undefined): Promise<void>;
+  /** Batch mode: single Gradle invocation, listener dumps per-test exec files, batchConvert produces coverage-final.json */
+  runAll?(projectRoot: string, workDir: string): Promise<void>;
   /** Override the default concurrency for this runner. If omitted, the CPU-based default is used. */
   defaultConcurrency?: number;
 }
@@ -87,6 +89,29 @@ const CPU_CONCURRENCY = Math.max(1, Math.min(Math.floor(os.cpus().length / 2), 1
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+function startBatchSpinner(isTTY: boolean, testCount: number): () => void {
+  if (!isTTY) {
+    process.stderr.write(`  Running ${testCount} tests in batch mode...\n`);
+    return () => {};
+  }
+  const start = Date.now();
+  let frame = 0;
+  const write = () => {
+    const secs = Math.round((Date.now() - start) / 1000);
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    const t = m > 0 ? `${m}m ${s}s` : `${s}s`;
+    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Batch test run (${testCount} tests)... ${t} elapsed`.padEnd(80));
+    frame++;
+  };
+  write();
+  const timer = setInterval(write, 100);
+  return () => {
+    clearInterval(timer);
+    process.stderr.write(`\r${' '.repeat(80)}\r`);
+  };
+}
+
 function startAggregateSpinner(isTTY: boolean): () => void {
   if (!isTTY) {
     process.stderr.write('  Running aggregate coverage pass...\n');
@@ -110,6 +135,48 @@ function startAggregateSpinner(isTTY: boolean): () => void {
   };
 }
 
+function safeFileName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+export function batchOutputToMap(
+  batchRaw: Record<string, Record<string, number[]>>,
+  testCases: TestCase[],
+  projectRoot: string,
+): TestLineMap {
+  const tcByKey = new Map<string, TestCase>();
+  for (const tc of testCases) {
+    const key = safeFileName(`${tc.describePath}.${tc.title}`);
+    if (tcByKey.has(key)) {
+      process.stderr.write(`  coverage-insights: safeFileName collision for key "${key}" — one test's coverage may be lost\n`);
+    }
+    tcByKey.set(key, tc);
+  }
+  const map: TestLineMap = {};
+  let unmatchedCount = 0;
+  for (const [testKey, fileLines] of Object.entries(batchRaw)) {
+    const tc = tcByKey.get(testKey);
+    if (!tc) { unmatchedCount++; continue; }
+    const sourceLines: Record<string, number[]> = {};
+    for (const [absPath, lines] of Object.entries(fileLines)) {
+      if (lines.length > 0) sourceLines[shortPath(absPath, projectRoot)] = lines;
+    }
+    if (Object.keys(sourceLines).length === 0) continue;
+    const key = `${shortPath(tc.filePath, projectRoot)} > ${tc.fullName}`;
+    map[key] = {
+      file: shortPath(tc.filePath, projectRoot),
+      fullName: tc.fullName,
+      title: tc.title,
+      describePath: tc.describePath,
+      sourceLines,
+    };
+  }
+  if (unmatchedCount > 0) {
+    process.stderr.write(`  coverage-insights: ${unmatchedCount} batch output keys had no matching test — parameterized tests or JUnit 5 tests are not supported in batch mode\n`);
+  }
+  return map;
+}
+
 export async function build(opts: BuildOptions, runner: Runner): Promise<BuildResult> {
   const defaultConcurrency = runner.defaultConcurrency ?? CPU_CONCURRENCY;
   const { projectRoot, outDir, concurrency = defaultConcurrency, fileFilter, configPath } = opts;
@@ -120,67 +187,90 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
   const testCases = await runner.discover(projectRoot, fileFilter, configPath);
   if (testCases.length === 0) return { map: {}, summary: {} };
 
-  if (process.stderr.isTTY) process.stderr.write(`  Running ${testCases.length} tests with concurrency=${concurrency}\n`);
-
-  // ── Step 2: Per-test isolation ───────────────────────────────────────────────
-  const tmpRoot = path.join(outDir, 'tmp-per-test');
-  fs.mkdirSync(tmpRoot, { recursive: true });
-
-  const map: TestLineMap = {};
-  let idx = 0, done = 0;
-  const total = testCases.length;
   const isTTY = process.stderr.isTTY;
-  const startTime = Date.now();
 
-  function formatEta(elapsedMs: number, completedSoFar: number): string {
-    if (completedSoFar === 0) return '';
-    const mins = (elapsedMs / completedSoFar) * (total - completedSoFar) / 60000;
-    if (mins < 1) return '< 1 min';
-    if (mins < 60) return `~${Math.ceil(mins)} min${Math.ceil(mins) !== 1 ? 's' : ''}`;
-    const h = Math.floor(mins / 60);
-    const m = Math.round(mins % 60);
-    return m === 0 ? `~${h}h` : `~${h}h ${m}m`;
-  }
+  // ── Step 2: Per-test coverage ────────────────────────────────────────────────
+  let map: TestLineMap = {};
 
-  function progress(): void {
-    if (!isTTY) return;
-    const pct = Math.round((done / total) * 100);
-    const filled = Math.floor(pct / 5);
-    const bar = `[${'█'.repeat(filled)}${' '.repeat(20 - filled)}]`;
-    const eta = done > 0 ? ` ${formatEta(Date.now() - startTime, done)}` : '';
-    process.stderr.write(`\r  ${bar} ${done}/${total} (${pct}%)${eta}`.padEnd(80));
-  }
-
-  function clearProgress(): void {
-    if (isTTY) process.stderr.write(`\r${' '.repeat(80)}\r`);
-  }
-
-  async function runOne(tc: TestCase, workerIdx: number): Promise<void> {
-    const workerDir = path.join(tmpRoot, `worker-${workerIdx}`);
-    progress();
+  if (runner.runAll) {
+    // ── Step 2 (batch): single Gradle invocation ────────────────────────────
+    const batchDir = path.join(outDir, 'batch');
+    fs.mkdirSync(batchDir, { recursive: true });
+    const stopBatch = startBatchSpinner(isTTY, testCases.length);
     try {
-      await runner.runOne(tc, projectRoot, workerDir, configPath);
-      const coveragePath = path.join(workerDir, 'coverage-final.json');
-      if (fs.existsSync(coveragePath)) {
-        const raw = JSON.parse(fs.readFileSync(coveragePath, 'utf8')) as Record<string, unknown>;
-        const sourceLines = extractLines(raw, projectRoot);
-        const key = `${shortPath(tc.filePath, projectRoot)} > ${tc.fullName}`;
-        map[key] = { file: shortPath(tc.filePath, projectRoot), fullName: tc.fullName, title: tc.title, describePath: tc.describePath, sourceLines };
-        fs.rmSync(coveragePath);
+      await runner.runAll(projectRoot, batchDir);
+      stopBatch();
+      const batchPath = path.join(batchDir, 'coverage-final.json');
+      if (fs.existsSync(batchPath)) {
+        const batchRaw = JSON.parse(fs.readFileSync(batchPath, 'utf8')) as Record<string, Record<string, number[]>>;
+        map = batchOutputToMap(batchRaw, testCases, projectRoot);
       }
-    } catch { /* individual test failure — skip */ }
-    done++;
-    progress();
+    } finally {
+      stopBatch();  // idempotent — clearInterval is safe to call twice
+      fs.rmSync(batchDir, { recursive: true, force: true });
+    }
+  } else {
+    // ── Step 2 (per-test): worker pool ─────────────────────────────────────
+    if (isTTY) process.stderr.write(`  Running ${testCases.length} tests with concurrency=${concurrency}\n`);
+
+    const tmpRoot = path.join(outDir, 'tmp-per-test');
+    fs.mkdirSync(tmpRoot, { recursive: true });
+
+    let idx = 0, done = 0;
+    const total = testCases.length;
+    const startTime = Date.now();
+
+    function formatEta(elapsedMs: number, completedSoFar: number): string {
+      if (completedSoFar === 0) return '';
+      const mins = (elapsedMs / completedSoFar) * (total - completedSoFar) / 60000;
+      if (mins < 1) return '< 1 min';
+      if (mins < 60) return `~${Math.ceil(mins)} min${Math.ceil(mins) !== 1 ? 's' : ''}`;
+      const h = Math.floor(mins / 60);
+      const m = Math.round(mins % 60);
+      return m === 0 ? `~${h}h` : `~${h}h ${m}m`;
+    }
+
+    function progress(): void {
+      if (!isTTY) return;
+      const pct = Math.round((done / total) * 100);
+      const filled = Math.floor(pct / 5);
+      const bar = `[${'█'.repeat(filled)}${' '.repeat(20 - filled)}]`;
+      const eta = done > 0 ? ` ${formatEta(Date.now() - startTime, done)}` : '';
+      process.stderr.write(`\r  ${bar} ${done}/${total} (${pct}%)${eta}`.padEnd(80));
+    }
+
+    function clearProgress(): void {
+      if (isTTY) process.stderr.write(`\r${' '.repeat(80)}\r`);
+    }
+
+    async function runOne(tc: TestCase, workerIdx: number): Promise<void> {
+      const workerDir = path.join(tmpRoot, `worker-${workerIdx}`);
+      progress();
+      try {
+        await runner.runOne(tc, projectRoot, workerDir, configPath);
+        const coveragePath = path.join(workerDir, 'coverage-final.json');
+        if (fs.existsSync(coveragePath)) {
+          const raw = JSON.parse(fs.readFileSync(coveragePath, 'utf8')) as Record<string, unknown>;
+          const sourceLines = extractLines(raw, projectRoot);
+          const key = `${shortPath(tc.filePath, projectRoot)} > ${tc.fullName}`;
+          map[key] = { file: shortPath(tc.filePath, projectRoot), fullName: tc.fullName, title: tc.title, describePath: tc.describePath, sourceLines };
+          fs.rmSync(coveragePath);
+        }
+      } catch { /* individual test failure — skip */ }
+      done++;
+      progress();
+    }
+
+    async function workerFn(workerIdx: number): Promise<void> {
+      while (idx < testCases.length) await runOne(testCases[idx++], workerIdx);
+    }
+
+    await Promise.all(Array.from({ length: concurrency }, (_, i) => workerFn(i)));
+    clearProgress();
+    // Remove per-test worker directories now that coverage data has been extracted into map.
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 
-  async function worker(workerIdx: number): Promise<void> {
-    while (idx < testCases.length) await runOne(testCases[idx++], workerIdx);
-  }
-
-  await Promise.all(Array.from({ length: concurrency }, (_, i) => worker(i)));
-  clearProgress();
-  // Remove per-test worker directories now that coverage data has been extracted into map.
-  fs.rmSync(tmpRoot, { recursive: true, force: true });
   // ── Step 3: Aggregate ────────────────────────────────────────────────────────
   const aggregateDir = path.join(outDir, 'aggregate');
   let summary: CoverageSummary = {};

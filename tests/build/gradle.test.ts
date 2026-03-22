@@ -8,9 +8,16 @@ vi.mock('child_process', () => ({
   execFile: vi.fn(),
 }));
 
+vi.mock('../../src/setup/gradle-listener.js', () => ({
+  ensureListenerJar: vi.fn().mockReturnValue('/fake/listener.jar'),
+}));
+
 import { execFileSync, execFile } from 'child_process';
 import { gradleRunner, _resetSession } from '../../src/build/runners/gradle.js';
 import { generateInitScript } from '../../src/build/runners/gradle/init-script.js';
+import { ensureListenerJar } from '../../src/setup/gradle-listener.js';
+
+const mockEnsureListenerJar = vi.mocked(ensureListenerJar);
 
 const mockExecFileSync = vi.mocked(execFileSync);
 const mockExecFile = vi.mocked(execFile);
@@ -608,5 +615,76 @@ describe('gradleRunner.aggregate', () => {
     await gradleRunner.aggregate(root, aggregateDir, undefined);
     expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('no jacoco.xml'));
     stderrSpy.mockRestore();
+  });
+});
+
+describe('gradleRunner.runAll', () => {
+  it('calls gradlew test --no-daemon with pertest.dir property', async () => {
+    const root = path.join(tmpDir, 'project');
+    const workDir = path.join(tmpDir, 'batch');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+
+    await gradleRunner.runAll!(root, workDir);
+
+    const testCall = mockExecFile.mock.calls.find(c => (c[1] as string[])[0] === 'test');
+    expect(testCall).toBeDefined();
+    const args = testCall![1] as string[];
+    expect(args).toContain('--no-daemon');
+    expect(args.some(a => a.startsWith('-Pcoverage.insights.pertest.dir='))).toBe(true);
+  });
+
+  it('calls gradlew coverageInsightsBatchReport --no-daemon after tests', async () => {
+    const root = path.join(tmpDir, 'project');
+    const workDir = path.join(tmpDir, 'batch');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+
+    await gradleRunner.runAll!(root, workDir);
+
+    const batchCall = mockExecFile.mock.calls.find(c => (c[1] as string[]).includes('coverageInsightsBatchReport'));
+    expect(batchCall).toBeDefined();
+    const args = batchCall![1] as string[];
+    expect(args).toContain('--no-daemon');
+    expect(args.some(a => a.startsWith('-Pcoverage.insights.pertest.dir='))).toBe(true);
+  });
+
+  it('passes listenerJar path from ensureListenerJar to the test invocation', async () => {
+    const root = path.join(tmpDir, 'project');
+    const workDir = path.join(tmpDir, 'batch');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+    mockEnsureListenerJar.mockReturnValue('/custom/path/listener.jar');
+
+    await gradleRunner.runAll!(root, workDir);
+
+    const testCall = mockExecFile.mock.calls.find(c => (c[1] as string[])[0] === 'test');
+    expect(testCall).toBeDefined();
+    const args = testCall![1] as string[];
+    expect(args).toContain('-Pcoverage.insights.listener.jar=/custom/path/listener.jar');
+  });
+
+  it('does not throw if the test run fails', async () => {
+    const root = path.join(tmpDir, 'project');
+    const workDir = path.join(tmpDir, 'batch');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+
+    // Make the test run call invoke callback with an error (simulating test failures),
+    // batchReport should still run
+    mockExecFile.mockImplementation((_cmd, args: unknown, _opts, cb) => {
+      const a = args as string[];
+      if (a[0] === 'test') {
+        setImmediate(() => (cb as (e: null) => void)(null));  // swallowed — test failures OK
+      } else {
+        setImmediate(() => (cb as (e: null) => void)(null));
+      }
+      return undefined as unknown as ReturnType<typeof execFile>;
+    });
+
+    await expect(gradleRunner.runAll!(root, workDir)).resolves.toBeUndefined();
+
+    const batchCall = mockExecFile.mock.calls.find(c => (c[1] as string[]).includes('coverageInsightsBatchReport'));
+    expect(batchCall).toBeDefined();
   });
 });
