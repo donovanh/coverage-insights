@@ -1,6 +1,6 @@
 {
   "name": "coverage-insights",
-  "version": "0.3.18",
+  "version": "0.3.19",
   "description": "Per-test coverage analysis for Vitest, Jest, and Gradle/JVM projects — find redundant tests, fragile lines, and coverage gaps.",
   "repository": {
     "type": "git",
