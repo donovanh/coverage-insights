@@ -22,6 +22,10 @@ export function _resetSession(): void {
 function ensureSession(projectRoot: string): void {
   if (_gradleCmd && _initScriptPath) return;
   _gradleCmd = findGradleCommand(projectRoot);
+  // Clear any stale daemons from previous interrupted runs before starting.
+  try {
+    execFileSync(_gradleCmd, ['--stop'], { cwd: projectRoot, stdio: 'pipe' });
+  } catch { /* no daemons running is fine */ }
   const modules = parseModules(projectRoot).map(m => moduleToPath(m, projectRoot));
   const needsInjection = !detectJacoco(projectRoot, modules);
   const script = generateInitScript(needsInjection);
@@ -338,8 +342,7 @@ export const gradleRunner: Runner = {
     const testArgs = [
       `${taskPrefix}test`,
       '--tests', testFilter,
-      '--daemon',
-      `--project-cache-dir=${_daemonCacheDir}`,
+      '--no-daemon',
       '--init-script', initScript,
       `-Pcoverage.insights.xmlDir=${workerDir}`,
     ];
