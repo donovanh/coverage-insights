@@ -37,9 +37,11 @@ public class PerTestCoverageListener extends RunListener {
     }
 
     private void resetJacoco() {
+        if (outputDir.isEmpty()) return;
         try {
-            getAgent().getClass().getMethod("reset").invoke(getAgent());
-        } catch (Exception ignored) {}
+            Object agent = getAgent();
+            agent.getClass().getMethod("reset").invoke(agent);
+        } catch (Throwable ignored) {}
     }
 
     private void dumpExec(String dir, String name) {
@@ -53,7 +55,8 @@ public class PerTestCoverageListener extends RunListener {
             File out = new File(dir, name + ".exec");
             out.getParentFile().mkdirs();
             Files.write(out.toPath(), data);
-        } catch (Exception ignored) {}
+            currentTestName = null;
+        } catch (Throwable ignored) {}
     }
 
     private Object getAgent() throws Exception {
