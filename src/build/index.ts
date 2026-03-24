@@ -215,12 +215,14 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
         const key = safeFileName(`${tc.describePath}.${tc.title}`);
         tcByKey.set(key, tc);
       }
+      let matchedBatch = 0;
       let unmatchedBatch = 0;
       for (const f of fs.readdirSync(batchDir)) {
         if (!f.endsWith('.json') || f.startsWith('.')) continue;
         const testKey = f.slice(0, -5);
         const tc = tcByKey.get(testKey);
         if (!tc) { unmatchedBatch++; continue; }
+        matchedBatch++;
         const fileLines = JSON.parse(fs.readFileSync(path.join(batchDir, f), 'utf8')) as Record<string, number[]>;
         const sourceLines: Record<string, number[]> = {};
         for (const [absPath, lines] of Object.entries(fileLines)) {
@@ -230,11 +232,11 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
         const key = `${shortPath(tc.filePath, projectRoot)} > ${tc.fullName}`;
         map[key] = { file: shortPath(tc.filePath, projectRoot), fullName: tc.fullName, title: tc.title, describePath: tc.describePath, sourceLines };
       }
-      if (unmatchedBatch > 0) {
-        process.stderr.write(`  coverage-insights: ${unmatchedBatch} batch output files had no matching test — parameterized tests or JUnit 5 tests are not supported in batch mode\n`);
-      } else {
+      if (matchedBatch === 0 && unmatchedBatch === 0) {
         process.stderr.write('  coverage-insights: batch conversion produced no output.\n' +
           '  Check that JaCoCo jars are resolvable (jacocoAnt or buildscript classpath).\n');
+      } else if (unmatchedBatch > 0) {
+        process.stderr.write(`  coverage-insights: ${unmatchedBatch} batch output files had no matching test — parameterized tests or JUnit 5 tests are not supported in batch mode\n`);
       }
     } finally {
       stopBatch(); // idempotent — clearInterval is safe to call twice
