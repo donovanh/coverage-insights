@@ -6,3 +6,4 @@ CLAUDE.md
 docs/
 .worktrees/
 coverage/
+.DS_Store

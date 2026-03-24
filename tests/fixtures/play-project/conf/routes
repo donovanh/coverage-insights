@@ -1,0 +1,9 @@
+# Routes for play-project fixture
+
+GET     /                           controllers.Application.index()
+GET     /home                       controllers.HomeController.index()
+POST    /home                       controllers.HomeController.submit()
+GET     /admin                      controllers.AdminController.list()
+POST    /admin                      controllers.AdminController.create()
+GET     /admin/{id}                 controllers.AdminController.view(id)
+GET     /favicon.ico                staticDir:public

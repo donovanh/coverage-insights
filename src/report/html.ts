@@ -1,5 +1,25 @@
 import type { AnalysisReport, AnalysisOptions } from '../types.js';
 
+export interface PlayControllerEntry {
+  relativePath: string;
+  simpleName:   string;
+  status:       'routed' | 'view-referenced' | 'java-referenced' | 'test-only' | 'unreferenced';
+  refs: { inRoutes: boolean; inViews: boolean; inJava: boolean; inTests: boolean };
+}
+
+export interface PlayReportData {
+  controllers: PlayControllerEntry[];
+}
+
+interface Row {
+  cat:      string;
+  catLabel: string;
+  catColor: string;
+  subject:  string; // plain text — escaped on render
+  detail:   string; // HTML-ready (may contain badge markup)
+  rec:      string; // plain text — escaped on render
+}
+
 function esc(s: string | number): string {
   return String(s)
     .replace(/&/g, '&amp;')
@@ -8,275 +28,162 @@ function esc(s: string | number): string {
     .replace(/"/g, '&quot;');
 }
 
-function table(headers: string[], rows: string[][]): string {
-  if (rows.length === 0) return '<p class="none">No findings.</p>';
-  const th = headers.map(h => `<th>${esc(h)}</th>`).join('');
-  const trs = rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('\n');
-  return `<table><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>`;
+function badge(label: string, color: string): string {
+  return `<span class="badge badge-${color}">${esc(label)}</span>`;
 }
 
-function badge(label: string, type: 'blue' | 'indigo' | 'red' | 'amber' | 'grey'): string {
-  return `<span class="badge badge-${type}">${esc(label)}</span>`;
+function overlapRec(aLines: number, bLines: number, sharedLines: number, jaccard: number): string {
+  if (aLines === sharedLines && bLines > sharedLines) return 'A is entirely inside B. Consider removing A.';
+  if (bLines === sharedLines && aLines > sharedLines) return 'B is entirely inside A. Consider removing B.';
+  return `Significant overlap (${(jaccard * 100).toFixed(1)}%). Investigate before removing either.`;
 }
 
-function actionBadge(action: string): string {
-  if (action === 'it.each')           return badge('it.each', 'blue');
-  if (action === 'merge-assertions')  return badge('merge-assertions', 'indigo');
-  if (action.startsWith('delete'))    return badge(action, 'red');
-  if (action === 'add test')          return badge('add test', 'amber');
-  if (action === 'check')             return badge('check', 'amber');
-  return badge('investigate', 'grey');
+function deadStatusBadge(status: PlayControllerEntry['status']): string {
+  if (status === 'unreferenced')    return badge('unreferenced', 'red');
+  if (status === 'test-only')       return badge('test-only', 'amber');
+  if (status === 'view-referenced') return badge('view-referenced', 'grey');
+  return badge('java-referenced', 'grey');
 }
 
-function badgeGuide(items: Array<{ action: string; desc: string; count: number }>): string {
-  const parts = items.map(({ action, desc, count }) =>
-    `${actionBadge(action)} <span class="guide-text">${esc(desc)} <strong>(${count})</strong></span>`,
-  );
-  return `<p class="badge-guide">${parts.join('')}</p>`;
+function deadRec(status: PlayControllerEntry['status']): string {
+  if (status === 'unreferenced')    return 'No routes, views, or code references found. Consider removing.';
+  if (status === 'test-only')       return 'Referenced only in tests. Verify it is not a forgotten feature.';
+  if (status === 'view-referenced') return 'Referenced in views but not routes. Check for direct template calls.';
+  return 'Referenced in non-controller Java. Check usage before removing.';
 }
 
-function tips(items: string[]): string {
-  if (items.length === 0) return '';
-  const li = items.map(t => `<li>${t}</li>`).join('');
-  return `<details class="tips"><summary>How to use this</summary><div class="tip-body"><ul>${li}</ul></div></details>`;
-}
+export function htmlReport(report: AnalysisReport, _opts: AnalysisOptions = {}, playData?: PlayReportData): string {
+  const { highOverlapPairs, zeroContribution, hotLines, consolidationGroups } = report.redundancy;
+  const { fragileLines } = report.coverageDepth;
 
-function section(
-  id: string,
-  title: string,
-  oneLiner: string,
-  guide: string,
-  content: string,
-  topN?: number,
-  total?: number,
-  tipItems?: string[],
-): string {
-  const note = topN !== undefined && total !== undefined && total >= topN
-    ? `<p class="note">Showing top ${topN} of ${total} findings.</p>`
-    : '';
-  return `<section id="${id}">
-  <h2>${esc(title)}</h2>
-  <p class="section-desc">${oneLiner}</p>
-  ${guide}
-  ${tips(tipItems ?? [])}
-  <div class="section-body">${note}${content}</div>
-</section>`;
-}
+  const partialOverlapPairs = highOverlapPairs.filter(p => p.jaccard < 1.0);
 
-function summaryCard(id: string, count: number, label: string, colorClass: string, tooltip: string): string {
-  return `<a href="#${id}" class="card ${colorClass}" title="${esc(tooltip)}">
+  // ── Build unified row list ──────────────────────────────────────────────────
+  const rows: Row[] = [];
+
+  for (const tc of zeroContribution) {
+    rows.push({
+      cat: 'zero', catLabel: 'Zero-contribution', catColor: 'grey',
+      subject: tc.fullName,
+      detail:  esc(tc.supersetTest),
+      rec:     'All lines covered by a larger test. Consider deleting or merging assertions.',
+    });
+  }
+
+  for (const p of partialOverlapPairs) {
+    rows.push({
+      cat: 'overlap', catLabel: 'Overlap', catColor: 'indigo',
+      subject: `${p.a} / ${p.b}`,
+      detail:  `${(p.jaccard * 100).toFixed(1)}% shared (${p.sharedLines} lines)`,
+      rec:     overlapRec(p.aLines, p.bLines, p.sharedLines, p.jaccard),
+    });
+  }
+
+  for (const g of consolidationGroups) {
+    const label = g.describePath ? `${g.describePath} (${g.tests.length} tests)` : `${g.file} (${g.tests.length} tests)`;
+    rows.push({
+      cat: 'consolidate', catLabel: 'Consolidation', catColor: 'blue',
+      subject: label,
+      detail:  esc(g.file),
+      rec:     g.suggestion === 'it.each'
+        ? 'Collapse into a parameterised it.each test.'
+        : 'Merge assertions into a single test.',
+    });
+  }
+
+  for (const h of hotLines) {
+    rows.push({
+      cat: 'hot', catLabel: 'Hot line', catColor: 'red',
+      subject: `${h.source}:${h.line}`,
+      detail:  `${h.coveredBy} tests`,
+      rec:     `Covered by ${h.coveredBy} tests. Check for redundant variations.`,
+    });
+  }
+
+  for (const f of fragileLines) {
+    rows.push({
+      cat: 'fragile', catLabel: 'Fragile', catColor: 'amber',
+      subject: `${f.source}:${f.line}`,
+      detail:  esc(f.coveredBy),
+      rec:     'Only one test covers this line. Add a second for safety.',
+    });
+  }
+
+  const deadControllers = playData?.controllers.filter(c => c.status !== 'routed') ?? [];
+  for (const c of deadControllers) {
+    rows.push({
+      cat: 'dead', catLabel: 'Dead controller', catColor: 'grey',
+      subject: c.relativePath,
+      detail:  deadStatusBadge(c.status),
+      rec:     deadRec(c.status),
+    });
+  }
+
+  // ── Categories ──────────────────────────────────────────────────────────────
+  type Cat = { cat: string; label: string; color: string; tooltip: string };
+  const categories: Cat[] = [
+    { cat: 'zero',        label: 'Zero-contribution', color: 'grey',   tooltip: 'Tests whose lines are all covered by a larger test. Safe to delete or merge.' },
+    { cat: 'overlap',     label: 'Overlap',            color: 'indigo', tooltip: 'Test pairs with many shared lines. One may be redundant if contained within the other.' },
+    { cat: 'consolidate', label: 'Consolidation',      color: 'blue',   tooltip: 'Tests with identical line coverage in the same describe block. Collapse into a parameterised test.' },
+    { cat: 'hot',         label: 'Hot lines',          color: 'red',    tooltip: 'Lines hit by many tests. May indicate redundant variations in the test suite.' },
+    { cat: 'fragile',     label: 'Fragile lines',      color: 'amber',  tooltip: 'Lines covered by a single test only. A break here would go undetected without a second.' },
+    ...(playData ? [{ cat: 'dead', label: 'Dead controllers', color: 'grey', tooltip: 'Controllers not referenced by routes, views, or application code. Candidates for removal.' }] : []),
+  ];
+
+  const countByCat: Record<string, number> = {};
+  for (const r of rows) countByCat[r.cat] = (countByCat[r.cat] ?? 0) + 1;
+
+  // ── Summary cards ───────────────────────────────────────────────────────────
+  function card(cat: string, label: string, count: number, color: string, tooltip: string): string {
+    return `<a class="card card-${color}" onclick="return ciFilter('${cat}',this)" title="${esc(tooltip)}">
   <div class="card-count">${count}</div>
   <div class="card-label">${esc(label)}</div>
 </a>`;
-}
-
-export function htmlReport(report: AnalysisReport, opts: AnalysisOptions = {}): string {
-  const { topN } = opts;
-  const { highOverlapPairs, zeroContribution, hotLines, consolidationGroups } = report.redundancy;
-  const { fragileLines, uncoveredFunctions, lowCoverageFiles } = report.coverageDepth;
-
-  // Filter out jaccard=1.0 pairs — already shown in consolidation groups
-  const partialOverlapPairs = highOverlapPairs.filter(p => p.jaccard < 1.0);
-
-  // ── Computed action counts for badge guides ──
-
-  const itEachCount   = consolidationGroups.filter(g => g.suggestion === 'it.each').length;
-  const mergeCount    = consolidationGroups.filter(g => g.suggestion === 'merge-assertions').length;
-  const _consolidationTestTotal = consolidationGroups.reduce((n, g) => n + g.tests.length, 0);
-
-  type OverlapAction = 'delete a?' | 'delete b?' | 'investigate';
-  function overlapAction(p: typeof partialOverlapPairs[0]): OverlapAction {
-    if (p.aLines === p.sharedLines && p.bLines > p.sharedLines) return 'delete a?';
-    if (p.bLines === p.sharedLines && p.aLines > p.sharedLines) return 'delete b?';
-    return 'investigate';
   }
-  const deleteACount      = partialOverlapPairs.filter(p => overlapAction(p) === 'delete a?').length;
-  const deleteBCount      = partialOverlapPairs.filter(p => overlapAction(p) === 'delete b?').length;
-  const investigateCount  = partialOverlapPairs.filter(p => overlapAction(p) === 'investigate').length;
-
-  // Group fragile lines by source file for count-by-file summary
-  const fragileByFile = new Map<string, number>();
-  for (const f of fragileLines) {
-    fragileByFile.set(f.source, (fragileByFile.get(f.source) ?? 0) + 1);
-  }
-
-  // ── Overlap table ──
-  const overlapRows = partialOverlapPairs.map(p => {
-    const action = overlapAction(p);
-    return [
-      esc(p.a),
-      esc(p.b),
-      `${(p.jaccard * 100).toFixed(1)}%`,
-      esc(p.sharedLines),
-      actionBadge(action),
-    ];
-  });
-  const overlapTable = table(
-    ['Test A', 'Test B', 'Jaccard', 'Shared lines', 'Action'],
-    overlapRows,
-  );
-
-  // ── Zero contribution — add delete? badge per row ──
-  const zeroTable = table(
-    ['Test', 'File', 'Action'],
-    zeroContribution.map(t => [esc(t.fullName), esc(t.file), actionBadge('delete?')]),
-  );
-
-  // ── Hot lines ──
-  const hotTable = table(
-    ['Source', 'Line', 'Tests covering'],
-    hotLines.map(h => [esc(h.source), esc(h.line), esc(h.coveredBy)]),
-  );
-
-  // ── Consolidation groups as cards ──
-  function consolidationCards(): string {
-    if (consolidationGroups.length === 0) return '<p class="none">No findings.</p>';
-    return consolidationGroups.map(g => {
-      const testList = g.tests.map(t => `<li>${esc(t)}</li>`).join('');
-      const fileShort = g.file.split('/').slice(-2).join('/');
-      const savings = g.tests.length - 1;
-      return `<div class="consolidation-card">
-  <div class="consolidation-header">
-    ${actionBadge(g.suggestion)}
-    <span class="consolidation-file">${esc(fileShort)}</span>
-    ${g.describePath ? `<span class="consolidation-describe">${esc(g.describePath)}</span>` : ''}
-    <span class="consolidation-savings">−${savings} test${savings !== 1 ? 's' : ''}</span>
-  </div>
-  <ul class="test-list">${testList}</ul>
-</div>`;
-    }).join('\n');
-  }
-
-  // ── Fragile lines — add "add test" badge per row ──
-  const fragileTable = table(
-    ['Source', 'Line', 'Sole covering test', 'Action'],
-    fragileLines.map(f => [esc(f.source), esc(f.line), esc(f.coveredBy), actionBadge('add test')]),
-  );
-
-  // ── Uncovered functions — add "add test" or "check" badge ──
-  const uncoveredTable = table(
-    ['Source', 'Function', 'Line', 'Action'],
-    uncoveredFunctions.map(u => [esc(u.source), esc(u.name), esc(u.line), actionBadge('check')]),
-  );
-
-  // ── Low coverage files ──
-  const lowTable = table(
-    ['Source', 'Line coverage', 'Action'],
-    lowCoverageFiles.map(lf => [esc(lf.source), `${lf.lineCoverage.toFixed(1)}%`, actionBadge('add test')]),
-  );
-
-  // ── Tooltip text per card (one-liners) ──
-  const tooltips = {
-    consolidate: 'Tests in the same describe block with identical line coverage.',
-    overlap:     'Test pairs sharing a high proportion of covered lines.',
-    zero:        'Tests whose every covered line is also covered by a single larger test.',
-    hot:         'Source lines covered by an unusually high number of tests.',
-    fragile:     'Source lines covered by exactly one test.',
-    uncovered:   'Functions never called during the test run.',
-    lowcoverage: 'Source files below the line coverage threshold.',
-  };
 
   const summaryGrid = `<div class="summary-grid">
-  ${summaryCard('consolidate', consolidationGroups.length, 'Consolidation candidates', 'card-blue',   tooltips.consolidate)}
-  ${summaryCard('overlap',     partialOverlapPairs.length, 'Overlapping test pairs',   'card-indigo', tooltips.overlap)}
-  ${summaryCard('zero',        zeroContribution.length,    'Zero-contribution tests',  'card-red',    tooltips.zero)}
-  ${summaryCard('hot',         hotLines.length,            'Hot lines',                'card-amber',  tooltips.hot)}
-  ${summaryCard('fragile',     fragileLines.length,        'Fragile lines',            'card-amber',  tooltips.fragile)}
-  ${summaryCard('uncovered',   uncoveredFunctions.length,  'Uncovered functions',      'card-red',    tooltips.uncovered)}
-  ${summaryCard('lowcoverage', lowCoverageFiles.length,    'Low coverage files',       'card-grey',   tooltips.lowcoverage)}
+  ${categories.map(c => card(c.cat, c.label, countByCat[c.cat] ?? 0, c.color, c.tooltip)).join('\n  ')}
 </div>`;
+
+  // ── Toolbar ─────────────────────────────────────────────────────────────────
+  const toolbar = `<div class="toolbar">
+  <input id="ci-search" type="search" placeholder="Filter…" oninput="ciApply()">
+</div>`;
+
+  // ── Table ───────────────────────────────────────────────────────────────────
+  const tableRows = rows.length === 0
+    ? '<tr class="ci-prompt"><td colspan="4" class="none">No findings.</td></tr>'
+    : rows.map(r => `<tr data-cat="${r.cat}" class="ci-hidden">
+  <td>${badge(r.catLabel, r.catColor)}</td>
+  <td class="cell-subject">${esc(r.subject)}</td>
+  <td class="cell-detail">${r.detail}</td>
+  <td class="cell-rec">${esc(r.rec)}</td>
+</tr>`).join('\n');
+
+  const tableHtml = `<table id="ci-table">
+<thead>
+  <tr>
+    <th>Category</th>
+    <th>Subject</th>
+    <th>Larger test / Detail</th>
+    <th>Recommendation</th>
+  </tr>
+</thead>
+<tbody>
+${rows.length > 0 ? '<tr class="ci-prompt"><td colspan="4" class="none">Select a category above to filter findings.</td></tr>' : ''}
+${tableRows}
+</tbody>
+</table>`;
+
+  const intro = `<p class="intro">Generated from per-test coverage data. Each finding highlights a specific inefficiency in your test suite. Click a category card to filter the table, or use the search box to narrow by file or test name.</p>`;
 
   const body = [
     `<h1>coverage-insights</h1>`,
     `<p class="generated">Generated: ${new Date().toISOString()}</p>`,
+    intro,
     summaryGrid,
-
-    `<h2 class="group-heading">Redundancy</h2>`,
-
-    section('consolidate', 'Consolidation candidates',
-      tooltips.consolidate,
-      badgeGuide([
-        { action: 'it.each',          desc: 'Collapse into a parameterised test',        count: itEachCount },
-        { action: 'merge-assertions', desc: 'Combine assertions into one test',           count: mergeCount },
-      ]),
-      consolidationCards(), topN, consolidationGroups.length,
-      [
-        '<code>it.each</code> suits input/output variations of the same behaviour; <code>merge-assertions</code> suits multiple <code>expect</code> calls on one shared setup.',
-        'Merging reduces test count but check readability — sometimes separate tests are clearer.',
-        'Don\'t merge tests with different mock setups even if their line coverage matches.',
-      ]),
-
-    section('overlap', 'High-overlap pairs',
-      tooltips.overlap,
-      badgeGuide([
-        { action: 'delete a?',   desc: 'Test A is fully inside test B — remove A',         count: deleteACount },
-        { action: 'delete b?',   desc: 'Test B is fully inside test A — remove B',         count: deleteBCount },
-        { action: 'investigate', desc: 'Significant overlap — review for intentional diff', count: investigateCount },
-      ]),
-      overlapTable, topN, partialOverlapPairs.length,
-      [
-        'Jaccard similarity measures shared <em>line coverage</em>, not shared behaviour — two tests on the same lines can assert very different things.',
-        '<strong>delete a?</strong> means test A\'s lines are fully contained in B — A adds no new coverage.',
-        '<strong>investigate</strong> means partial overlap — verify the tests cover genuinely different code paths before removing either.',
-      ]),
-
-    section('zero', 'Zero-contribution tests',
-      tooltips.zero,
-      badgeGuide([
-        { action: 'delete?', desc: 'Every line this test covers is also covered by a larger test', count: zeroContribution.length },
-      ]),
-      zeroTable, topN, zeroContribution.length,
-      [
-        'Don\'t just delete. Check if the flagged test\'s <em>assertions</em> differ from the superset test.',
-        'If assertions are unique, merge them into the covering test instead of deleting.',
-        'Unit tests for utility functions often appear here because a higher-level test calls them indirectly — these are usually worth keeping.',
-      ]),
-
-    section('hot', 'Hot lines',
-      tooltips.hot,
-      badgeGuide([]),
-      hotTable, topN, hotLines.length,
-      [
-        'Many tests covering one line doesn\'t mean it\'s well-tested — they may all hit the same happy path.',
-        'Check whether each covering test asserts something meaningfully different, or whether they\'re redundant variations.',
-        'Shared setup code (constructors, imports) often appears here and is not actionable.',
-      ]),
-
-    `<h2 class="group-heading">Coverage depth</h2>`,
-
-    section('fragile', 'Fragile lines',
-      tooltips.fragile,
-      badgeGuide([
-        { action: 'add test', desc: 'Add a second test covering this line', count: fragileLines.length },
-      ]),
-      fragileTable, topN, fragileLines.length,
-      [
-        'A line covered by exactly one test will go undetected if that test is deleted or changed.',
-        'Only actionable for critical behaviour — some code paths are only reachable one way and a single test is fine.',
-      ]),
-
-    section('uncovered', 'Uncovered functions',
-      tooltips.uncovered,
-      badgeGuide([
-        { action: 'check', desc: 'Add tests or confirm this function is intentionally untested', count: uncoveredFunctions.length },
-      ]),
-      uncoveredTable, topN, uncoveredFunctions.length,
-      [
-        'These functions were never called during any test run.',
-        'Check if the function is reachable at all — if not, consider removing it.',
-        'If reachable but untested, add a test before the next refactor.',
-      ]),
-
-    section('lowcoverage', 'Low coverage files',
-      tooltips.lowcoverage,
-      badgeGuide([
-        { action: 'add test', desc: 'Add tests to bring coverage above threshold', count: lowCoverageFiles.length },
-      ]),
-      lowTable, topN, lowCoverageFiles.length,
-      [
-        'Focus here first when adding new tests.',
-        'Look at which branches are missing, not just the percentage — 60% with all critical paths covered may be healthier than 90% with untested error handling.',
-      ]),
+    toolbar,
+    tableHtml,
   ].join('\n');
 
   return `<!DOCTYPE html>
@@ -287,92 +194,104 @@ export function htmlReport(report: AnalysisReport, opts: AnalysisOptions = {}): 
 <title>coverage-insights report</title>
 <style>
   :root {
-    --blue:   #2563eb;
-    --indigo: #4f46e5;
-    --red:    #dc2626;
-    --amber:  #d97706;
-    --grey:   #6b7280;
-    --blue-bg:   #eff6ff;
-    --indigo-bg: #eef2ff;
-    --red-bg:    #fef2f2;
-    --amber-bg:  #fffbeb;
-    --grey-bg:   #f9fafb;
+    --blue:   #2563eb; --indigo: #4f46e5; --red:   #dc2626;
+    --amber:  #d97706; --green:  #16a34a; --grey:  #6b7280;
+    --orange: #ea580c;
+    --blue-bg:   #eff6ff; --indigo-bg: #eef2ff; --red-bg:   #fef2f2;
+    --amber-bg:  #fffbeb; --green-bg:  #f0fdf4; --grey-bg:  #f9fafb;
+    --orange-bg: #fff7ed;
   }
   * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; max-width: 1200px; margin: 2rem auto; padding: 0 1.5rem; color: #111; line-height: 1.5; }
-  h1 { font-size: 1.75rem; margin: 0 0 .25rem; }
-  .generated { color: #888; font-size: .85rem; margin: 0 0 2rem; }
-  h2 { font-size: 1.2rem; margin: 0 0 .4rem; color: #111; }
-  .group-heading { font-size: 1.4rem; margin: 2.5rem 0 1rem; border-bottom: 2px solid #e5e7eb; padding-bottom: .4rem; }
-  section { margin-bottom: 2rem; }
-  .section-desc { color: #555; font-size: .9rem; margin: 0 0 .5rem; }
-  .section-body { max-height: 420px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 6px; padding: .5rem; background: #fff; }
-  .section-body .none { padding: .25rem .25rem; }
-  .section-body table { border: none; }
-  .section-body .consolidation-card:last-child { margin-bottom: 0; }
-
-  /* Badge guide */
-  .badge-guide { display: flex; flex-wrap: wrap; gap: .5rem .75rem; align-items: center; margin: 0 0 .75rem; font-size: .85rem; }
-  .guide-text { color: #555; }
-  .badge-guide:empty { display: none; }
-
-  /* Tips */
-  details.tips { margin: 0.4rem 0 0.75rem; }
-  details.tips summary { font-size: 0.8rem; color: #3b82f6; cursor: pointer; list-style: none; display: flex; align-items: center; gap: 0.3rem; }
-  details.tips summary::marker { display: none; }
-  details.tips summary::before { content: '▶'; font-size: 0.6rem; transition: transform 0.15s; }
-  details[open].tips summary::before { transform: rotate(90deg); }
-  details.tips .tip-body { background: #f0f9ff; border-left: 3px solid #3b82f6; padding: 0.6rem 0.8rem; margin-top: 0.4rem; font-size: 0.8rem; color: #334155; border-radius: 0 4px 4px 0; line-height: 1.6; }
-  details.tips .tip-body ul { margin: 0.25rem 0 0 1rem; padding: 0; }
-  details.tips .tip-body li { margin-bottom: 0.2rem; }
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 1.5rem 2rem; color: #111; line-height: 1.5; background: #f8f9fa; }
+  h1 { font-size: 1.6rem; margin: 0 0 .2rem; }
+  .generated { color: #888; font-size: .85rem; margin: 0 0 .75rem; }
+  .intro { color: #555; font-size: .88rem; margin: 0 0 1.25rem; max-width: 72ch; }
 
   /* Summary cards */
-  .summary-grid { display: flex; flex-wrap: wrap; gap: .75rem; margin-bottom: 2.5rem; }
-  .card { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1rem 1.25rem; border-radius: 8px; min-width: 120px; text-decoration: none; color: inherit; border: 1px solid transparent; transition: opacity .15s; cursor: pointer; }
+  .summary-grid { display: flex; flex-wrap: wrap; gap: .6rem; margin-bottom: 1.5rem; }
+  .card { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: .75rem 1rem; border-radius: 8px; min-width: 100px; text-decoration: none; color: inherit; border: 1px solid transparent; cursor: pointer; transition: opacity .15s; }
   .card:hover { opacity: .8; }
-  .card-count { font-size: 2rem; font-weight: 700; line-height: 1; }
-  .card-label { font-size: .75rem; text-align: center; margin-top: .25rem; color: #555; }
-  .card-blue   { background: var(--blue-bg);   border-color: #bfdbfe; }
-  .card-indigo { background: var(--indigo-bg); border-color: #c7d2fe; }
+  .card-count { font-size: 1.75rem; font-weight: 700; line-height: 1; }
+  .card-label { font-size: .72rem; text-align: center; margin-top: .2rem; color: #555; }
   .card-red    { background: var(--red-bg);    border-color: #fecaca; }
   .card-amber  { background: var(--amber-bg);  border-color: #fde68a; }
+  .card-blue   { background: var(--blue-bg);   border-color: #bfdbfe; }
+  .card-indigo { background: var(--indigo-bg); border-color: #c7d2fe; }
+  .card-green  { background: var(--green-bg);  border-color: #bbf7d0; }
+  .card-orange { background: var(--orange-bg); border-color: #fed7aa; }
   .card-grey   { background: var(--grey-bg);   border-color: #e5e7eb; }
+  .card.card-active { box-shadow: 0 0 0 3px #111; }
 
   /* Badges */
-  .badge { display: inline-block; padding: .15rem .5rem; border-radius: 4px; font-size: .78rem; font-weight: 600; white-space: nowrap; }
+  .badge { display: inline-block; padding: .15rem .45rem; border-radius: 4px; font-size: .76rem; font-weight: 600; white-space: nowrap; }
   .badge-blue   { background: var(--blue-bg);   color: var(--blue);   border: 1px solid #bfdbfe; }
   .badge-indigo { background: var(--indigo-bg); color: var(--indigo); border: 1px solid #c7d2fe; }
   .badge-red    { background: var(--red-bg);    color: var(--red);    border: 1px solid #fecaca; }
   .badge-amber  { background: var(--amber-bg);  color: var(--amber);  border: 1px solid #fde68a; }
+  .badge-green  { background: var(--green-bg);  color: var(--green);  border: 1px solid #bbf7d0; }
+  .badge-orange { background: var(--orange-bg); color: var(--orange); border: 1px solid #fed7aa; }
   .badge-grey   { background: var(--grey-bg);   color: var(--grey);   border: 1px solid #e5e7eb; }
 
-  /* Consolidation cards */
-  .consolidation-card { border: 1px solid #e5e7eb; border-radius: 8px; padding: .75rem 1rem; margin-bottom: .75rem; background: #fff; }
-  .consolidation-header { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .5rem; }
-  .consolidation-file { font-family: monospace; font-size: .85rem; color: #374151; }
-  .consolidation-describe { font-family: monospace; font-size: .8rem; color: #6b7280; background: #f3f4f6; padding: .1rem .4rem; border-radius: 4px; }
-  .consolidation-savings { font-size: .78rem; color: var(--red); font-weight: 600; margin-left: auto; }
-  .test-list { margin: 0; padding-left: 1.25rem; }
-  .test-list li { font-size: .85rem; color: #374151; padding: .1rem 0; font-family: monospace; }
+  /* Toolbar */
+  .toolbar { margin-bottom: 1rem; display: flex; flex-direction: column; gap: .5rem; }
+  #ci-search { padding: 7px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; width: 300px; font-family: inherit; outline: none; }
+  #ci-search:focus { border-color: #6b7280; }
+  .filter-btns { display: flex; gap: .4rem; flex-wrap: wrap; }
+  .fbtn { padding: 4px 12px; border-radius: 20px; border: 1px solid #d1d5db; background: white; cursor: pointer; font-size: 12px; font-family: inherit; transition: background .1s; }
+  .fbtn:hover { background: #f3f4f6; }
+  .fbtn.active { background: #111; color: white; border-color: #111; }
 
-  /* Tables */
-  table { border-collapse: collapse; width: 100%; font-size: .88rem; }
-  th { background: #f9fafb; text-align: left; padding: .5rem .75rem; border-bottom: 2px solid #e5e7eb; font-weight: 600; cursor: pointer; user-select: none; }
-  th:hover { background: #f3f4f6; }
-  td { padding: .4rem .75rem; border-bottom: 1px solid #f3f4f6; vertical-align: top; font-family: monospace; font-size: .82rem; }
-  td:last-child { font-family: system-ui, sans-serif; }
-  tr:hover td { background: #fafafa; }
-  .none { color: #9ca3af; font-style: italic; }
-  .note { color: #6b7280; font-style: italic; font-size: .85rem; }
-  code { background: #f3f4f6; padding: .1rem .3rem; border-radius: 3px; font-size: .85em; }
+  /* Table */
+  #ci-table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.1); font-size: 13px; }
+  #ci-table th { text-align: left; padding: 9px 12px; background: #f3f4f6; border-bottom: 2px solid #e5e7eb; font-size: 12px; white-space: nowrap; cursor: pointer; user-select: none; }
+  #ci-table th:hover { background: #e5e7eb; }
+  #ci-table td { padding: 7px 12px; border-bottom: 1px solid #f3f4f6; vertical-align: top; font-size: 12px; }
+  #ci-table tr:hover td { background: #fafafa; }
+  #ci-table tr.ci-hidden { display: none; }
+  #ci-table { table-layout: fixed; }
+  #ci-table th:nth-child(1) { width: 11%; }
+  #ci-table th:nth-child(2) { width: 30%; }
+  #ci-table th:nth-child(3) { width: 27%; }
+  #ci-table th:nth-child(4) { width: 32%; }
+  .cell-subject { font-family: monospace; word-break: break-all; }
+  .cell-detail  { font-family: monospace; color: #555; word-break: break-all; }
+  .cell-rec     { color: #374151; }
+  .none { color: #9ca3af; font-style: italic; padding: 1rem; display: block; }
 </style>
 <script>
+  let ciActive = null;
+
+  function ciFilter(cat, btn) {
+    if (ciActive === cat) {
+      ciActive = null;
+    } else {
+      ciActive = cat;
+      document.querySelectorAll('.summary-grid .card').forEach(c => c.classList.remove('card-active'));
+      btn.classList.add('card-active');
+    }
+    ciApply();
+    return false;
+  }
+
+  function ciApply() {
+    const q       = (document.getElementById('ci-search')?.value ?? '').toLowerCase().trim();
+    const prompt  = document.querySelector('#ci-table .ci-prompt');
+    const hasFilter = ciActive !== null || q.length > 0;
+    if (prompt) prompt.classList.toggle('ci-hidden', hasFilter);
+    document.querySelectorAll('#ci-table tbody tr[data-cat]').forEach(row => {
+      const matchCat  = ciActive === null || row.dataset.cat === ciActive;
+      const matchText = !q || (row.textContent ?? '').toLowerCase().includes(q);
+      row.classList.toggle('ci-hidden', !(hasFilter && matchCat && matchText));
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
-    document.querySelectorAll('th').forEach((th, i) => {
+    // Sortable column headers
+    document.querySelectorAll('#ci-table th').forEach((th, i) => {
       th.addEventListener('click', () => {
-        const tbl = th.closest('table');
-        const rows = Array.from(tbl.querySelectorAll('tbody tr'));
-        const asc = th.dataset.sort !== 'asc';
+        const tbody = th.closest('table').querySelector('tbody');
+        const rows  = Array.from(tbody.querySelectorAll('tr[data-cat]'));
+        const asc   = th.dataset.sort !== 'asc';
         rows.sort((a, b) => {
           const at = a.cells[i]?.textContent ?? '';
           const bt = b.cells[i]?.textContent ?? '';
@@ -380,7 +299,7 @@ export function htmlReport(report: AnalysisReport, opts: AnalysisOptions = {}): 
           return (!isNaN(an) && !isNaN(bn) ? an - bn : at.localeCompare(bt)) * (asc ? 1 : -1);
         });
         th.dataset.sort = asc ? 'asc' : 'desc';
-        rows.forEach(r => tbl.querySelector('tbody').appendChild(r));
+        rows.forEach(r => tbody.appendChild(r));
       });
     });
   });

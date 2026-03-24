@@ -74,10 +74,14 @@ export interface LowCoverageFile {
   lineCoverage: number; // 0–100
 }
 
+export interface ZeroContributionEntry extends TestEntry {
+  supersetTest: string; // fullName of the test that subsumes this one
+}
+
 export interface AnalysisReport {
   redundancy: {
     highOverlapPairs: OverlapPair[];
-    zeroContribution: TestEntry[];
+    zeroContribution: ZeroContributionEntry[];
     hotLines: HotLine[];
     consolidationGroups: ConsolidationGroup[];
   };

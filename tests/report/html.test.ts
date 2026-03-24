@@ -2,6 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { htmlReport } from '../../src/report/html.js';
 import type { AnalysisReport } from '../../src/types.js';
 
+function makeZero(fullName: string, supersetTest = 'superset test'): import('../../src/types.js').ZeroContributionEntry {
+  return { file: 'a.ts', fullName, title: fullName, describePath: '', sourceLines: {}, supersetTest };
+}
+
 function makeReport(overrides: Partial<AnalysisReport> = {}): AnalysisReport {
   return {
     redundancy: { highOverlapPairs: [], zeroContribution: [], hotLines: [], consolidationGroups: [] },
@@ -10,6 +14,7 @@ function makeReport(overrides: Partial<AnalysisReport> = {}): AnalysisReport {
   };
 }
 
+// ─── Structure ───────────────────────────────────────────────────────────────
 describe('htmlReport — structure', () => {
   it('returns a string starting with <!DOCTYPE html>', () => {
     const html = htmlReport(makeReport());
@@ -21,375 +26,269 @@ describe('htmlReport — structure', () => {
     expect(html).not.toMatch(/<script\s+src=/i);
     expect(html).not.toMatch(/<link\s+rel="stylesheet"/i);
   });
+
+  it('contains a single unified table with id="ci-table"', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toContain('id="ci-table"');
+  });
+
+  it('shows "No findings." when all sections are empty', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toContain('No findings.');
+  });
 });
 
-// ─── actionBadge colour mapping ──────────────────────────────────────────────
-describe('htmlReport — badge colours', () => {
-  it('it.each suggestion produces a blue badge', () => {
+// ─── Filter buttons ───────────────────────────────────────────────────────────
+describe('htmlReport — filter buttons', () => {
+  it('contains category labels in the summary cards', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toContain('Zero-contribution');
+    expect(html).toContain('Hot lines');
+    expect(html).toContain('Fragile lines');
+    expect(html).toContain('Overlap');
+    expect(html).toContain('Consolidation');
+  });
+
+  it('does NOT contain a separate row of pill filter buttons', () => {
+    const html = htmlReport(makeReport());
+    expect(html).not.toContain('class="filter-btns"');
+    expect(html).not.toContain('class="fbtn"');
+  });
+
+  it('shows "Select a category" prompt when findings exist but no filter active', () => {
+    const report = makeReport({
+      coverageDepth: { fragileLines: [{ source: 'src/a.ts', line: 1, coveredBy: 'x' }], uncoveredFunctions: [], lowCoverageFiles: [] },
+    });
+    const html = htmlReport(report);
+    expect(html).toContain('Select a category');
+  });
+
+  it('does NOT have an "All findings" card', () => {
+    const html = htmlReport(makeReport());
+    expect(html).not.toContain('All findings');
+  });
+
+  it('contains Dead controllers button when playData is provided', () => {
+    const html = htmlReport(makeReport(), {}, { controllers: [] });
+    expect(html).toContain('Dead controllers');
+  });
+
+  it('does NOT contain Dead controllers button when no playData', () => {
+    const html = htmlReport(makeReport());
+    expect(html).not.toContain('Dead controllers');
+  });
+
+  it('contains a search input', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toContain('id="ci-search"');
+    expect(html).toContain('type="search"');
+  });
+});
+
+// ─── Summary cards ────────────────────────────────────────────────────────────
+describe('htmlReport — summary cards', () => {
+  it('shows correct count for zero-contribution tests', () => {
     const report = makeReport({
       redundancy: {
-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
-        consolidationGroups: [{
-          file: 'tests/foo.test.ts', describePath: 'x',
-          tests: ['x > test A', 'x > test B'],
-          suggestion: 'it.each',
-        }],
+        highOverlapPairs: [],
+        zeroContribution: [makeZero('test 1'), makeZero('test 2')],
+        hotLines: [], consolidationGroups: [],
       },
     });
     const html = htmlReport(report);
-    expect(html).toContain('badge-blue');
-    expect(html).toContain('it.each');
+    expect(html).toContain('<div class="card-count">2</div>');
   });
 
-  it('merge-assertions suggestion produces an indigo badge', () => {
+  it('shows 0 for empty sections', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toContain('<div class="card-count">0</div>');
+  });
+
+  it('each category shows its own count in the summary card', () => {
     const report = makeReport({
       redundancy: {
-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
-        consolidationGroups: [{
-          file: 'tests/foo.test.ts', describePath: 'x',
-          tests: ['x > test A', 'x > test B'],
-          suggestion: 'merge-assertions',
-        }],
+        highOverlapPairs: [],
+        zeroContribution: [makeZero('test 1'), makeZero('test 2')],
+        hotLines: [{ source: 'src/Foo.java', line: 1, coveredBy: 5 }],
+        consolidationGroups: [],
       },
     });
     const html = htmlReport(report);
-    expect(html).toContain('badge-indigo');
-    expect(html).toContain('merge-assertions');
+    // 2 zero-contribution, 1 hot
+    const counts = [...html.matchAll(/<div class="card-count">(\d+)<\/div>/g)].map(m => parseInt(m[1]));
+    expect(counts).toContain(2); // zero-contribution card
+    expect(counts).toContain(1); // hot lines card
+  });
+});
+
+// ─── Table rows: data-cat attributes ─────────────────────────────────────────
+describe('htmlReport — table rows', () => {
+  it('zero-contribution tests get data-cat="zero"', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [],
+        zeroContribution: [makeZero('my redundant test', 'the big test')],
+        hotLines: [], consolidationGroups: [],
+      },
+    });
+    const html = htmlReport(report);
+    expect(html).toContain('data-cat="zero"');
+    expect(html).toContain('my redundant test');
   });
 
-  it('fragile lines produce an amber "add test" badge', () => {
+  it('zero-contribution rows show the superset test in the detail column', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [],
+        zeroContribution: [makeZero('tiny test', 'the covering test')],
+        hotLines: [], consolidationGroups: [],
+      },
+    });
+    const html = htmlReport(report);
+    expect(html).toContain('the covering test');
+  });
+
+  it('overlap pairs get data-cat="overlap" and show jaccard percentage', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [{ a: 'test alpha', b: 'test beta', jaccard: 0.93, sharedLines: 8, aLines: 10, bLines: 9 }],
+        zeroContribution: [], hotLines: [], consolidationGroups: [],
+      },
+    });
+    const html = htmlReport(report);
+    expect(html).toContain('data-cat="overlap"');
+    expect(html).toContain('93.0%');
+    expect(html).toContain('test alpha');
+    expect(html).toContain('test beta');
+  });
+
+  it('formats jaccard=0.857 as 85.7%', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [{ a: 'A', b: 'B', jaccard: 0.857142, sharedLines: 6, aLines: 7, bLines: 7 }],
+        zeroContribution: [], hotLines: [], consolidationGroups: [],
+      },
+    });
+    expect(htmlReport(report)).toContain('85.7%');
+  });
+
+  it('jaccard=1.0 pairs are excluded from the table', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [{ a: 'dup A', b: 'dup B', jaccard: 1.0, sharedLines: 5, aLines: 5, bLines: 5 }],
+        zeroContribution: [], hotLines: [], consolidationGroups: [],
+      },
+    });
+    const html = htmlReport(report);
+    expect(html).not.toContain('dup A');
+    expect(html).not.toContain('dup B');
+  });
+
+  it('consolidation groups get data-cat="consolidate"', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [], zeroContribution: [], hotLines: [],
+        consolidationGroups: [{ file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B'], suggestion: 'it.each' }],
+      },
+    });
+    expect(htmlReport(report)).toContain('data-cat="consolidate"');
+  });
+
+  it('hot lines get data-cat="hot"', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [], zeroContribution: [],
+        hotLines: [{ source: 'src/Foo.java', line: 42, coveredBy: 12 }],
+        consolidationGroups: [],
+      },
+    });
+    const html = htmlReport(report);
+    expect(html).toContain('data-cat="hot"');
+    expect(html).toContain('src/Foo.java');
+  });
+
+  it('fragile lines get data-cat="fragile"', () => {
+    const report = makeReport({
+      coverageDepth: {
+        fragileLines: [{ source: 'src/Bar.java', line: 7, coveredBy: 'sole test' }],
+        uncoveredFunctions: [], lowCoverageFiles: [],
+      },
+    });
+    const html = htmlReport(report);
+    expect(html).toContain('data-cat="fragile"');
+    expect(html).toContain('src/Bar.java');
+  });
+});
+
+// ─── Recommendations ──────────────────────────────────────────────────────────
+describe('htmlReport — recommendation text', () => {
+  it('zero-contribution recommendation says "consider deleting or merging assertions"', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [],
+        zeroContribution: [makeZero('test X')],
+        hotLines: [], consolidationGroups: [],
+      },
+    });
+    expect(htmlReport(report).toLowerCase()).toContain('consider deleting or merging assertions');
+  });
+
+  it('overlap where A is inside B recommends removing A', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [{ a: 'test small', b: 'test large', jaccard: 0.9, sharedLines: 5, aLines: 5, bLines: 8 }],
+        zeroContribution: [], hotLines: [], consolidationGroups: [],
+      },
+    });
+    expect(htmlReport(report).toLowerCase()).toMatch(/consider removing a|remove a/);
+  });
+
+  it('overlap where B is inside A recommends removing B', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [{ a: 'test large', b: 'test small', jaccard: 0.9, sharedLines: 5, aLines: 8, bLines: 5 }],
+        zeroContribution: [], hotLines: [], consolidationGroups: [],
+      },
+    });
+    expect(htmlReport(report).toLowerCase()).toMatch(/consider removing b|remove b/);
+  });
+
+  it('partial overlap recommends investigating', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [{ a: 'test A', b: 'test B', jaccard: 0.8, sharedLines: 4, aLines: 6, bLines: 6 }],
+        zeroContribution: [], hotLines: [], consolidationGroups: [],
+      },
+    });
+    expect(htmlReport(report).toLowerCase()).toContain('investigat');
+  });
+
+  it('fragile line recommendation mentions adding a second test', () => {
     const report = makeReport({
       coverageDepth: {
         fragileLines: [{ source: 'src/a.ts', line: 1, coveredBy: 'sole test' }],
         uncoveredFunctions: [], lowCoverageFiles: [],
       },
     });
-    const html = htmlReport(report);
-    expect(html).toContain('badge-amber');
-    expect(html).toContain('add test');
+    expect(htmlReport(report).toLowerCase()).toMatch(/add a second|add another/);
   });
 
-  it('uncovered functions produce an amber "check" badge', () => {
-    const report = makeReport({
-      coverageDepth: {
-        fragileLines: [],
-        uncoveredFunctions: [{ source: 'src/a.ts', name: 'myFn', line: 10 }],
-        lowCoverageFiles: [],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('badge-amber');
-    expect(html).toContain('check');
-  });
-
-  it('zero-contribution tests produce a red badge', () => {
+  it('hot line recommendation mentions redundant coverage or variations', () => {
     const report = makeReport({
       redundancy: {
-        highOverlapPairs: [],
-        zeroContribution: [{ file: 'tests/a.ts', fullName: 'test X', title: 'test X', describePath: '', sourceLines: {} }],
-        hotLines: [], consolidationGroups: [],
+        highOverlapPairs: [], zeroContribution: [],
+        hotLines: [{ source: 'src/x.ts', line: 1, coveredBy: 20 }],
+        consolidationGroups: [],
       },
     });
-    const html = htmlReport(report);
-    expect(html).toContain('badge-red');
+    expect(htmlReport(report).toLowerCase()).toMatch(/redundant|variations/);
   });
 
-  it('unknown action type falls back to grey "investigate" badge', () => {
-    // An overlap pair where neither a nor b is fully contained → investigate
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [{
-          a: 'test A', b: 'test B', jaccard: 0.85,
-          sharedLines: 5, aLines: 7, bLines: 8, // partial overlap — neither fully inside
-        }],
-        zeroContribution: [], hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('badge-grey');
-    expect(html).toContain('investigate');
-  });
-});
-
-// ─── overlapAction logic ─────────────────────────────────────────────────────
-describe('htmlReport — overlapAction', () => {
-  it('shows "delete a?" when all of A\'s lines are shared (A fully inside B)', () => {
-    // aLines === sharedLines means A is fully covered by B's lines
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [{
-          a: 'test A', b: 'test B', jaccard: 0.8,
-          sharedLines: 5, aLines: 5, bLines: 8,
-        }],
-        zeroContribution: [], hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('delete a?');
-    expect(html).toContain('badge-red');
-  });
-
-  it('shows "delete b?" when all of B\'s lines are shared (B fully inside A)', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [{
-          a: 'test A', b: 'test B', jaccard: 0.8,
-          sharedLines: 5, aLines: 8, bLines: 5,
-        }],
-        zeroContribution: [], hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('delete b?');
-  });
-
-  it('shows "investigate" in the table row when neither a nor b is fully contained', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [{
-          a: 'test A', b: 'test B', jaccard: 0.8,
-          sharedLines: 4, aLines: 6, bLines: 6,
-        }],
-        zeroContribution: [], hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    // badge guide always contains all three action labels; check the count
-    // deleteACount=0 and deleteBCount=0 → their badge guide entries show (0)
-    expect(html).toMatch(/delete a\?<\/span>.*?\(0\)/s);
-    expect(html).toMatch(/delete b\?<\/span>.*?\(0\)/s);
-    expect(html).toMatch(/investigate<\/span>.*?\(1\)/s);
-  });
-
-  it('filters out jaccard=1.0 pairs from the overlap table', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [{
-          a: 'identical A', b: 'identical B', jaccard: 1.0,
-          sharedLines: 5, aLines: 5, bLines: 5,
-        }],
-        zeroContribution: [], hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    // The pair has jaccard=1.0 so it's filtered from partialOverlapPairs
-    expect(html).not.toContain('identical A');
-    expect(html).not.toContain('identical B');
-  });
-
-  it('includes pairs with jaccard < 1.0 in the overlap table', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [{
-          a: 'test alpha', b: 'test beta', jaccard: 0.95,
-          sharedLines: 8, aLines: 9, bLines: 8,
-        }],
-        zeroContribution: [], hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('test alpha');
-    expect(html).toContain('test beta');
-  });
-});
-
-// ─── Jaccard percentage formatting ───────────────────────────────────────────
-describe('htmlReport — jaccard percentage', () => {
-  it('formats jaccard as percentage with 1 decimal place', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [{
-          a: 'test A', b: 'test B', jaccard: 0.93,
-          sharedLines: 8, aLines: 10, bLines: 9,
-        }],
-        zeroContribution: [], hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('93.0%');
-  });
-
-  it('formats jaccard=0.857 as 85.7%', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [{
-          a: 'test A', b: 'test B', jaccard: 0.857142,
-          sharedLines: 6, aLines: 7, bLines: 7,
-        }],
-        zeroContribution: [], hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('85.7%');
-  });
-});
-
-// ─── topN note ───────────────────────────────────────────────────────────────
-describe('htmlReport — topN note', () => {
-  it('shows "Showing top N of M" when total >= topN', () => {
-    const fragileLines = Array.from({ length: 5 }, (_, i) => ({
-      source: 'src/a.ts', line: i + 1, coveredBy: `test ${i}`,
-    }));
-    const report = makeReport({
-      coverageDepth: { fragileLines, uncoveredFunctions: [], lowCoverageFiles: [] },
-    });
-    const html = htmlReport(report, { topN: 5 });
-    expect(html).toContain('Showing top 5 of 5');
-  });
-
-  it('shows topN note when total > topN', () => {
-    const fragileLines = Array.from({ length: 10 }, (_, i) => ({
-      source: 'src/a.ts', line: i + 1, coveredBy: `test ${i}`,
-    }));
-    const report = makeReport({
-      coverageDepth: { fragileLines, uncoveredFunctions: [], lowCoverageFiles: [] },
-    });
-    const html = htmlReport(report, { topN: 3 });
-    expect(html).toContain('Showing top 3 of 10');
-  });
-
-  it('does NOT show topN note when total < topN', () => {
-    const fragileLines = [{ source: 'src/a.ts', line: 1, coveredBy: 'x' }];
-    const report = makeReport({
-      coverageDepth: { fragileLines, uncoveredFunctions: [], lowCoverageFiles: [] },
-    });
-    const html = htmlReport(report, { topN: 5 });
-    expect(html).not.toContain('Showing top');
-  });
-});
-
-// ─── Consolidation savings text ───────────────────────────────────────────────
-describe('htmlReport — consolidation savings', () => {
-  it('shows singular "−1 test" when group has 2 tests', () => {
+  it('does NOT include old "saving X tests" impact text', () => {
     const report = makeReport({
       redundancy: {
         highOverlapPairs: [], zeroContribution: [], hotLines: [],
-        consolidationGroups: [{
-          file: 'tests/foo.test.ts', describePath: 'g',
-          tests: ['g > A', 'g > B'], // 2 tests → savings = 1
-          suggestion: 'it.each',
-        }],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('−1 test');
-    expect(html).not.toContain('−1 tests');
-  });
-
-  it('shows plural "−2 tests" when group has 3 tests', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
-        consolidationGroups: [{
-          file: 'tests/foo.test.ts', describePath: 'g',
-          tests: ['g > A', 'g > B', 'g > C'], // 3 tests → savings = 2
-          suggestion: 'it.each',
-        }],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('−2 tests');
-  });
-});
-
-// ─── Low coverage percentage formatting ──────────────────────────────────────
-describe('htmlReport — low coverage file formatting', () => {
-  it('formats lineCoverage with 1 decimal place', () => {
-    const report = makeReport({
-      coverageDepth: {
-        fragileLines: [], uncoveredFunctions: [],
-        lowCoverageFiles: [{ source: 'src/legacy.ts', lineCoverage: 42.567 }],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('42.6%');
-    expect(html).toContain('src/legacy.ts');
-  });
-
-  it('formats whole-number coverage correctly', () => {
-    const report = makeReport({
-      coverageDepth: {
-        fragileLines: [], uncoveredFunctions: [],
-        lowCoverageFiles: [{ source: 'src/old.ts', lineCoverage: 70 }],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('70.0%');
-  });
-});
-
-// ─── Badge guide counts ───────────────────────────────────────────────────────
-describe('htmlReport — badge guide counts', () => {
-  it('shows correct count for it.each groups in badge guide', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
-        consolidationGroups: [
-          { file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B'], suggestion: 'it.each' },
-          { file: 'b.ts', describePath: 'y', tests: ['y > A', 'y > B'], suggestion: 'merge-assertions' },
-        ],
-      },
-    });
-    const html = htmlReport(report);
-    // badge guide shows "(1)" for it.each and "(1)" for merge-assertions
-    expect(html).toContain('it.each');
-    expect(html).toContain('merge-assertions');
-    // both appear in the guide with count indicators
-    const matches = html.match(/<strong>\((\d+)\)<\/strong>/g);
-    expect(matches).not.toBeNull();
-  });
-
-  it('shows correct deleteA/deleteB/investigate counts in overlap badge guide', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [
-          { a: 'A', b: 'B', jaccard: 0.9, sharedLines: 5, aLines: 5, bLines: 7 }, // delete a?
-          { a: 'C', b: 'D', jaccard: 0.9, sharedLines: 4, aLines: 6, bLines: 4 }, // delete b?
-          { a: 'E', b: 'F', jaccard: 0.9, sharedLines: 3, aLines: 5, bLines: 5 }, // investigate
-        ],
-        zeroContribution: [], hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    expect(html).toContain('delete a?');
-    expect(html).toContain('delete b?');
-    expect(html).toContain('investigate');
-  });
-});
-
-// ─── Summary card counts ──────────────────────────────────────────────────────
-describe('htmlReport — summary cards', () => {
-  it('summary grid includes correct count for zero-contribution tests', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [],
-        zeroContribution: [
-          { file: 'a.ts', fullName: 'test 1', title: 'test 1', describePath: '', sourceLines: {} },
-          { file: 'b.ts', fullName: 'test 2', title: 'test 2', describePath: '', sourceLines: {} },
-        ],
-        hotLines: [], consolidationGroups: [],
-      },
-    });
-    const html = htmlReport(report);
-    // Summary card for zero shows count "2"
-    expect(html).toContain('<div class="card-count">2</div>');
-  });
-
-  it('summary grid shows 0 for empty sections', () => {
-    const html = htmlReport(makeReport());
-    expect(html).toContain('<div class="card-count">0</div>');
-  });
-});
-
-// ─── Consolidation impact line removed ───────────────────────────────────────
-describe('htmlReport — consolidation impact text', () => {
-  it('does NOT show the misleading "saving X tests" impact paragraph', () => {
-    const report = makeReport({
-      redundancy: {
-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
-        consolidationGroups: [
-          { file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B', 'x > C'], suggestion: 'it.each' },
-        ],
+        consolidationGroups: [{ file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B', 'x > C'], suggestion: 'it.each' }],
       },
     });
     const html = htmlReport(report);
@@ -398,41 +297,167 @@ describe('htmlReport — consolidation impact text', () => {
   });
 });
 
-// ─── Tips blocks ──────────────────────────────────────────────────────────────
-describe('htmlReport — tips blocks', () => {
-  it('each section renders a <details class="tips"> element', () => {
-    const html = htmlReport(makeReport());
-    const count = (html.match(/<details class="tips">/g) ?? []).length;
-    expect(count).toBe(7);
+// ─── Badge colours ────────────────────────────────────────────────────────────
+describe('htmlReport — category badge colours', () => {
+  it('zero-contribution rows use grey badge', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [],
+        zeroContribution: [makeZero('test X')],
+        hotLines: [], consolidationGroups: [],
+      },
+    });
+    expect(htmlReport(report)).toContain('badge-grey');
   });
 
-  it('summary label is "How to use this" in every section', () => {
-    const html = htmlReport(makeReport());
-    const count = (html.match(/<summary>How to use this<\/summary>/g) ?? []).length;
-    expect(count).toBe(7);
+  it('hot line rows use red badge', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [], zeroContribution: [],
+        hotLines: [{ source: 'src/x.ts', line: 1, coveredBy: 10 }],
+        consolidationGroups: [],
+      },
+    });
+    expect(htmlReport(report)).toContain('badge-red');
   });
 
-  it('<details> has no open attribute — collapsed by default', () => {
-    const html = htmlReport(makeReport());
-    expect(html).not.toContain('<details class="tips" open>');
-    expect(html).not.toContain('<details open');
+  it('fragile line rows use amber badge', () => {
+    const report = makeReport({
+      coverageDepth: {
+        fragileLines: [{ source: 'src/a.ts', line: 1, coveredBy: 'sole test' }],
+        uncoveredFunctions: [], lowCoverageFiles: [],
+      },
+    });
+    expect(htmlReport(report)).toContain('badge-amber');
   });
 
-  it('tips content appears in the zero-contribution section', () => {
-    const html = htmlReport(makeReport());
-    expect(html).toContain("Don't just delete");
+  it('overlap rows use indigo badge', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [{ a: 'A', b: 'B', jaccard: 0.9, sharedLines: 5, aLines: 7, bLines: 7 }],
+        zeroContribution: [], hotLines: [], consolidationGroups: [],
+      },
+    });
+    expect(htmlReport(report)).toContain('badge-indigo');
   });
 
-  it('tips content appears in the low-coverage section', () => {
-    const html = htmlReport(makeReport());
-    expect(html).toContain('Focus here first when adding new tests');
+  it('consolidation rows use blue badge', () => {
+    const report = makeReport({
+      redundancy: {
+        highOverlapPairs: [], zeroContribution: [], hotLines: [],
+        consolidationGroups: [{ file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B'], suggestion: 'it.each' }],
+      },
+    });
+    expect(htmlReport(report)).toContain('badge-blue');
   });
 });
 
-// ─── Empty sections ───────────────────────────────────────────────────────────
-describe('htmlReport — empty section fallback', () => {
-  it('shows "No findings." for sections with no data', () => {
+// ─── Tooltips ─────────────────────────────────────────────────────────────────
+describe('htmlReport — card tooltips', () => {
+  it('zero-contribution card has a descriptive tooltip mentioning larger test', () => {
     const html = htmlReport(makeReport());
-    expect(html).toContain('No findings.');
+    expect(html).toMatch(/title="[^"]*larger test[^"]*"/i);
+  });
+
+  it('hot lines card has a descriptive tooltip mentioning many tests', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toMatch(/title="[^"]*many tests[^"]*"/i);
+  });
+
+  it('fragile lines card has a descriptive tooltip mentioning single test', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toMatch(/title="[^"]*single test[^"]*"/i);
+  });
+
+  it('overlap card has a descriptive tooltip mentioning shared lines', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toMatch(/title="[^"]*shared lines[^"]*"/i);
+  });
+
+  it('consolidation card has a descriptive tooltip mentioning identical', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toMatch(/title="[^"]*identical[^"]*"/i);
+  });
+
+  it('dead controllers card tooltip mentions routes when play data provided', () => {
+    const html = htmlReport(makeReport(), {}, { controllers: [] });
+    expect(html).toMatch(/title="[^"]*routes[^"]*"/i);
+  });
+});
+
+// ─── Intro text ───────────────────────────────────────────────────────────────
+describe('htmlReport — intro text', () => {
+  it('contains an intro paragraph above the summary grid', () => {
+    const html = htmlReport(makeReport());
+    expect(html).toContain('class="intro"');
+  });
+
+  it('intro text mentions per-test coverage', () => {
+    const html = htmlReport(makeReport());
+    const introIdx = html.indexOf('class="intro"');
+    expect(introIdx).toBeGreaterThan(-1);
+    const snippet = html.slice(introIdx, introIdx + 400);
+    expect(snippet.toLowerCase()).toContain('per-test');
+  });
+
+  it('intro text appears before the summary grid', () => {
+    const html = htmlReport(makeReport());
+    const introIdx = html.indexOf('class="intro"');
+    const gridIdx  = html.indexOf('class="summary-grid"');
+    expect(introIdx).toBeLessThan(gridIdx);
+  });
+});
+
+// ─── Play controller analysis ─────────────────────────────────────────────────
+describe('htmlReport — Play controller analysis', () => {
+  const playData = {
+    controllers: [
+      { relativePath: 'app/controllers/HomeController.java', simpleName: 'HomeController', status: 'routed' as const,       refs: { inRoutes: true,  inViews: false, inJava: false, inTests: false } },
+      { relativePath: 'app/controllers/DeadController.java', simpleName: 'DeadController', status: 'unreferenced' as const, refs: { inRoutes: false, inViews: false, inJava: false, inTests: false } },
+      { relativePath: 'app/controllers/TestOnlyCtrl.java',   simpleName: 'TestOnlyCtrl',   status: 'test-only' as const,    refs: { inRoutes: false, inViews: false, inJava: false, inTests: true  } },
+    ],
+  };
+
+  it('renders dead controller rows when play data is provided', () => {
+    const html = htmlReport(makeReport(), {}, playData);
+    expect(html).toContain('DeadController');
+    expect(html).toContain('TestOnlyCtrl');
+  });
+
+  it('does NOT render dead controller rows when play data is absent', () => {
+    const html = htmlReport(makeReport());
+    expect(html).not.toContain('data-cat="dead"');
+    expect(html).not.toContain('Dead controllers');
+  });
+
+  it('dead controller rows have data-cat="dead"', () => {
+    const html = htmlReport(makeReport(), {}, playData);
+    expect(html).toContain('data-cat="dead"');
+  });
+
+  it('unreferenced controllers get a red status badge', () => {
+    const html = htmlReport(makeReport(), {}, playData);
+    const deadIdx = html.indexOf('DeadController');
+    const snippet = html.slice(Math.max(0, deadIdx - 400), deadIdx + 400);
+    expect(snippet).toMatch(/badge-red/);
+  });
+
+  it('test-only controllers get an amber status badge', () => {
+    const html = htmlReport(makeReport(), {}, playData);
+    const idx = html.indexOf('TestOnlyCtrl');
+    const snippet = html.slice(Math.max(0, idx - 400), idx + 400);
+    expect(snippet).toMatch(/badge-amber/);
+  });
+
+  it('routed controllers do NOT appear in dead rows', () => {
+    const html = htmlReport(makeReport(), {}, playData);
+    // Find all data-cat="dead" rows and check none contain HomeController
+    const deadSection = html.match(/data-cat="dead"[\s\S]*?<\/tr>/g) ?? [];
+    expect(deadSection.every(r => !r.includes('HomeController'))).toBe(true);
+  });
+
+  it('dead controller recommendation says "consider removing" for unreferenced', () => {
+    const html = htmlReport(makeReport(), {}, playData);
+    expect(html.toLowerCase()).toContain('consider removing');
   });
 });

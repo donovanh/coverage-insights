@@ -1,0 +1,3674 @@
+diff --git a/src/analyse.ts b/src/analyse.ts
+index b163b71..1f2853a 100644
+--- a/src/analyse.ts
++++ b/src/analyse.ts
+@@ -3,6 +3,7 @@ import type {
+   CoverageSummary,
+   AnalysisOptions,
+   AnalysisReport,
++  ZeroContributionEntry,
+   OverlapPair,
+   ConsolidationGroup,
+   HotLine,
+@@ -80,14 +81,14 @@ export function analyse(
+ 
+   // ── Zero contribution: only flag if another test is a STRICT superset ──
+   // (covers all same lines AND has more lines — avoids flagging identical-coverage tests)
+-  const zeroContribution: TestEntry[] = [];
++  const zeroContribution: ZeroContributionEntry[] = [];
+   for (const { entry, lines } of scoped) {
+     if (lines.size === 0) continue;
+-    const isSubsumed = scoped.some(other => {
++    const superset = scoped.find(other => {
+       if (other.entry.fullName === entry.fullName) return false;
+       return other.lines.size > lines.size && [...lines].every(l => other.lines.has(l));
+     });
+-    if (isSubsumed) zeroContribution.push(entry);
++    if (superset) zeroContribution.push({ ...entry, supersetTest: superset.entry.fullName });
+   }
+ 
+   // ── Hot lines ──
+diff --git a/src/build/detect.ts b/src/build/detect.ts
+index 57a84e3..80af923 100644
+--- a/src/build/detect.ts
++++ b/src/build/detect.ts
+@@ -2,12 +2,13 @@ import fs from 'fs';
+ import path from 'path';
+ import { JEST_CONFIG_NAMES, VITEST_CONFIG_NAMES, GRADLE_BUILD_NAMES } from './runners/common.js';
+ 
+-export type RunnerType = 'vitest' | 'jest' | 'gradle';
++export type RunnerType = 'vitest' | 'jest' | 'gradle' | 'play';
+ 
+ export function detectRunner(projectRoot: string, runnerFlag?: string): RunnerType {
+   if (runnerFlag === 'jest') return 'jest';
+   if (runnerFlag === 'vitest') return 'vitest';
+   if (runnerFlag === 'gradle') return 'gradle';
++  if (runnerFlag === 'play') return 'play';
+ 
+   // Check for jest config files
+   for (const name of JEST_CONFIG_NAMES) {
+@@ -28,6 +29,13 @@ export function detectRunner(projectRoot: string, runnerFlag?: string): RunnerTy
+     if (fs.existsSync(path.join(projectRoot, name))) return 'vitest';
+   }
+ 
++  // Check for Play Framework (conf/routes + app/controllers/ — must precede Gradle check
++  // since Play projects also have build.gradle)
++  if (
++    fs.existsSync(path.join(projectRoot, 'conf', 'routes')) &&
++    fs.existsSync(path.join(projectRoot, 'app', 'controllers'))
++  ) return 'play';
++
+   // Check for Gradle build files
+   for (const name of GRADLE_BUILD_NAMES) {
+     if (fs.existsSync(path.join(projectRoot, name))) return 'gradle';
+diff --git a/src/build/index.ts b/src/build/index.ts
+index 048d999..3c40196 100644
+--- a/src/build/index.ts
++++ b/src/build/index.ts
+@@ -9,6 +9,7 @@ export interface BuildOptions {
+   projectRoot: string;
+   outDir: string;
+   concurrency?: number;
++  noAggregate?: boolean;
+   fileFilter?: string;
+   configPath?: string;
+ }
+@@ -21,9 +22,8 @@ export interface BuildResult {
+ export interface Runner {
+   discover(projectRoot: string, fileFilter: string | undefined, configPath: string | undefined): Promise<TestCase[]>;
+   runOne(tc: TestCase, projectRoot: string, workerDir: string, configPath: string | undefined): Promise<void>;
++  runAll?(projectRoot: string, workDir: string, testCases?: TestCase[]): Promise<void>;
+   aggregate(projectRoot: string, aggregateDir: string, configPath: string | undefined): Promise<void>;
+-  /** Batch mode: single Gradle invocation, listener dumps per-test exec files, batchConvert produces coverage-final.json */
+-  runAll?(projectRoot: string, workDir: string): Promise<void>;
+   /** Override the default concurrency for this runner. If omitted, the CPU-based default is used. */
+   defaultConcurrency?: number;
+ }
+@@ -86,10 +86,33 @@ function buildCoverageSummary(coverageFinal: Record<string, unknown>): CoverageS
+ }
+ 
+ const CPU_CONCURRENCY = Math.max(1, Math.min(Math.floor(os.cpus().length / 2), 10));
+-
+ const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+ 
+-function startBatchSpinner(isTTY: boolean, testCount: number): () => void {
++function startBatchSpinner(isTTY: boolean, testCount: number, batchDir: string): () => void {
++  let lastPollTime = 0;
++  let peakExec = 0;
++  let currentExec = 0;
++  function pollExec() {
++    const now = Date.now();
++    if (now - lastPollTime < 5000) return;
++    lastPollTime = now;
++    try {
++      const files = fs.readdirSync(batchDir);
++      const execCount = files.filter(f => f.endsWith('.exec')).length;
++      if (execCount > peakExec) peakExec = execCount;
++      currentExec = execCount;
++    } catch { /* ignore */ }
++  }
++  function formatEta(elapsedSecs: number): string {
++    if (peakExec === 0 || elapsedSecs === 0) return '';
++    const processed = peakExec - currentExec;
++    if (processed <= 0) return '';
++    const rate = processed / elapsedSecs;
++    const remainingSecs = Math.round(currentExec / rate);
++    const rm = Math.floor(remainingSecs / 60);
++    const rs = remainingSecs % 60;
++    return rm > 0 ? `~${rm}m ${rs}s remaining` : `~${rs}s remaining`;
++  }
+   if (!isTTY) {
+     process.stderr.write(`  Running ${testCount} tests in batch mode...\n`);
+     return () => {};
+@@ -97,11 +120,11 @@ function startBatchSpinner(isTTY: boolean, testCount: number): () => void {
+   const start = Date.now();
+   let frame = 0;
+   const write = () => {
+-    const secs = Math.round((Date.now() - start) / 1000);
+-    const m = Math.floor(secs / 60);
+-    const s = secs % 60;
+-    const t = m > 0 ? `${m}m ${s}s` : `${s}s`;
+-    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Batch test run (${testCount} tests)... ${t} elapsed`.padEnd(80));
++    pollExec();
++    const secs = (Date.now() - start) / 1000;
++    const eta = formatEta(secs);
++    const etaStr = eta ? `, ${eta}` : '';
++    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Batch test run (${testCount} tests)... ${formatElapsed(start)}${etaStr}`.padEnd(80));
+     frame++;
+   };
+   write();
+@@ -112,6 +135,16 @@ function startBatchSpinner(isTTY: boolean, testCount: number): () => void {
+   };
+ }
+ 
++function formatElapsed(startMs: number): string {
++  const ms = Date.now() - startMs;
++  const secs = ms / 1000;
++  if (secs < 10) return `${secs.toFixed(1)}s`;
++  const whole = Math.round(secs);
++  const m = Math.floor(whole / 60);
++  const s = whole % 60;
++  return m > 0 ? `${m}m ${s}s` : `${s}s`;
++}
++
+ function startAggregateSpinner(isTTY: boolean): () => void {
+   if (!isTTY) {
+     process.stderr.write('  Running aggregate coverage pass...\n');
+@@ -120,11 +153,7 @@ function startAggregateSpinner(isTTY: boolean): () => void {
+   const start = Date.now();
+   let frame = 0;
+   const write = () => {
+-    const secs = Math.round((Date.now() - start) / 1000);
+-    const m = Math.floor(secs / 60);
+-    const s = secs % 60;
+-    const t = m > 0 ? `${m}m ${s}s` : `${s}s`;
+-    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Aggregate coverage pass... ${t} elapsed`.padEnd(80));
++    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Aggregate coverage pass... ${formatElapsed(start)}`.padEnd(80));
+     frame++;
+   };
+   write();
+@@ -135,51 +164,31 @@ function startAggregateSpinner(isTTY: boolean): () => void {
+   };
+ }
+ 
+-function safeFileName(name: string): string {
+-  return name.replace(/[^a-zA-Z0-9._-]/g, '_');
++/** Sanitise a string to a safe file name, matching the Kotlin batchConvert naming. */
++function safeFileName(s: string): string {
++  return s.replace(/[^a-zA-Z0-9._-]/g, '_');
+ }
+ 
+-export function batchOutputToMap(
+-  batchRaw: Record<string, Record<string, number[]>>,
+-  testCases: TestCase[],
+-  projectRoot: string,
+-): TestLineMap {
+-  const tcByKey = new Map<string, TestCase>();
+-  for (const tc of testCases) {
+-    const key = safeFileName(`${tc.describePath}.${tc.title}`);
+-    if (tcByKey.has(key)) {
+-      process.stderr.write(`  coverage-insights: safeFileName collision for key "${key}" — one test's coverage may be lost\n`);
+-    }
+-    tcByKey.set(key, tc);
+-  }
+-  const map: TestLineMap = {};
+-  let unmatchedCount = 0;
+-  for (const [testKey, fileLines] of Object.entries(batchRaw)) {
+-    const tc = tcByKey.get(testKey);
+-    if (!tc) { unmatchedCount++; continue; }
+-    const sourceLines: Record<string, number[]> = {};
+-    for (const [absPath, lines] of Object.entries(fileLines)) {
+-      if (lines.length > 0) sourceLines[shortPath(absPath, projectRoot)] = lines;
++/** Write a large JSON object entry-by-entry to avoid V8 string length limits. */
++function streamWriteJson(filePath: string, obj: Record<string, unknown>): void {
++  const fd = fs.openSync(filePath, 'w');
++  try {
++    fs.writeSync(fd, '{\n');
++    const entries = Object.entries(obj);
++    for (let i = 0; i < entries.length; i++) {
++      const line = '  ' + JSON.stringify(entries[i][0]) + ': ' + JSON.stringify(entries[i][1])
++        + (i < entries.length - 1 ? ',' : '') + '\n';
++      fs.writeSync(fd, line);
+     }
+-    if (Object.keys(sourceLines).length === 0) continue;
+-    const key = `${shortPath(tc.filePath, projectRoot)} > ${tc.fullName}`;
+-    map[key] = {
+-      file: shortPath(tc.filePath, projectRoot),
+-      fullName: tc.fullName,
+-      title: tc.title,
+-      describePath: tc.describePath,
+-      sourceLines,
+-    };
++    fs.writeSync(fd, '}\n');
++  } finally {
++    fs.closeSync(fd);
+   }
+-  if (unmatchedCount > 0) {
+-    process.stderr.write(`  coverage-insights: ${unmatchedCount} batch output keys had no matching test — parameterized tests or JUnit 5 tests are not supported in batch mode\n`);
+-  }
+-  return map;
+ }
+ 
+ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildResult> {
+   const defaultConcurrency = runner.defaultConcurrency ?? CPU_CONCURRENCY;
+-  const { projectRoot, outDir, concurrency = defaultConcurrency, fileFilter, configPath } = opts;
++  const { projectRoot, outDir, concurrency = defaultConcurrency, noAggregate, fileFilter, configPath } = opts;
+ 
+   fs.mkdirSync(outDir, { recursive: true });
+ 
+@@ -193,29 +202,49 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
+   let map: TestLineMap = {};
+ 
+   if (runner.runAll) {
+-    // ── Step 2 (batch): single Gradle invocation ────────────────────────────
++    // ── Step 2 (batch): single Gradle invocation ──────────────────────────────
+     const batchDir = path.join(outDir, 'batch');
+     fs.mkdirSync(batchDir, { recursive: true });
+-    const stopBatch = startBatchSpinner(isTTY, testCases.length);
++    const stopBatch = startBatchSpinner(isTTY, testCases.length, batchDir);
+     try {
+-      await runner.runAll(projectRoot, batchDir);
++      await runner.runAll(projectRoot, batchDir, testCases);
+       stopBatch();
+-      const batchPath = path.join(batchDir, 'coverage-final.json');
+-      if (fs.existsSync(batchPath)) {
+-        const batchRaw = JSON.parse(fs.readFileSync(batchPath, 'utf8')) as Record<string, Record<string, number[]>>;
+-        map = batchOutputToMap(batchRaw, testCases, projectRoot);
++      // Read one JSON file per test — no single large string ever created
++      const tcByKey = new Map<string, TestCase>();
++      for (const tc of testCases) {
++        const key = safeFileName(`${tc.describePath}.${tc.title}`);
++        tcByKey.set(key, tc);
++      }
++      let unmatchedBatch = 0;
++      for (const f of fs.readdirSync(batchDir)) {
++        if (!f.endsWith('.json') || f.startsWith('.')) continue;
++        const testKey = f.slice(0, -5);
++        const tc = tcByKey.get(testKey);
++        if (!tc) { unmatchedBatch++; continue; }
++        const fileLines = JSON.parse(fs.readFileSync(path.join(batchDir, f), 'utf8')) as Record<string, number[]>;
++        const sourceLines: Record<string, number[]> = {};
++        for (const [absPath, lines] of Object.entries(fileLines)) {
++          if (lines.length > 0) sourceLines[shortPath(absPath, projectRoot)] = lines;
++        }
++        if (Object.keys(sourceLines).length === 0) continue;
++        const key = `${shortPath(tc.filePath, projectRoot)} > ${tc.fullName}`;
++        map[key] = { file: shortPath(tc.filePath, projectRoot), fullName: tc.fullName, title: tc.title, describePath: tc.describePath, sourceLines };
++      }
++      if (unmatchedBatch > 0) {
++        process.stderr.write(`  coverage-insights: ${unmatchedBatch} batch output files had no matching test — parameterized tests or JUnit 5 tests are not supported in batch mode\n`);
++      } else {
++        process.stderr.write('  coverage-insights: batch conversion produced no output.\n' +
++          '  Check that JaCoCo jars are resolvable (jacocoAnt or buildscript classpath).\n');
+       }
+     } finally {
+-      stopBatch();  // idempotent — clearInterval is safe to call twice
++      stopBatch(); // idempotent — clearInterval is safe to call twice
+       fs.rmSync(batchDir, { recursive: true, force: true });
+     }
+   } else {
+-    // ── Step 2 (per-test): worker pool ─────────────────────────────────────
++    // ── Step 2 (per-test): worker pool ────────────────────────────────────────
+     if (isTTY) process.stderr.write(`  Running ${testCases.length} tests with concurrency=${concurrency}\n`);
+-
+     const tmpRoot = path.join(outDir, 'tmp-per-test');
+     fs.mkdirSync(tmpRoot, { recursive: true });
+-
+     let idx = 0, done = 0;
+     const total = testCases.length;
+     const startTime = Date.now();
+@@ -274,17 +303,21 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
+   // ── Step 3: Aggregate ────────────────────────────────────────────────────────
+   const aggregateDir = path.join(outDir, 'aggregate');
+   let summary: CoverageSummary = {};
+-  const stopSpinner = startAggregateSpinner(isTTY);
+-  await runner.aggregate(projectRoot, aggregateDir, configPath);
+-  stopSpinner();
+-  const aggregatePath = path.join(aggregateDir, 'coverage-final.json');
+-  if (fs.existsSync(aggregatePath)) {
+-    summary = buildCoverageSummary(JSON.parse(fs.readFileSync(aggregatePath, 'utf8')) as Record<string, unknown>);
++  if (noAggregate) {
++    if (isTTY) process.stderr.write('  Skipping aggregate pass (--no-aggregate).\n');
++  } else {
++    const stopSpinner = startAggregateSpinner(isTTY);
++    await runner.aggregate(projectRoot, aggregateDir, configPath);
++    stopSpinner();
++    const aggregatePath = path.join(aggregateDir, 'coverage-final.json');
++    if (fs.existsSync(aggregatePath)) {
++      summary = buildCoverageSummary(JSON.parse(fs.readFileSync(aggregatePath, 'utf8')) as Record<string, unknown>);
++    }
+   }
+ 
+   // ── Step 4: Write outputs ─────────────────────────────────────────────────
+-  fs.writeFileSync(path.join(outDir, 'test-line-map.json'), JSON.stringify(map, null, 2));
+-  fs.writeFileSync(path.join(outDir, 'coverage-summary.json'), JSON.stringify(summary, null, 2));
++  streamWriteJson(path.join(outDir, 'test-line-map.json'), map as unknown as Record<string, unknown>);
++  streamWriteJson(path.join(outDir, 'coverage-summary.json'), summary as unknown as Record<string, unknown>);
+ 
+   return { map, summary };
+ }
+diff --git a/src/build/runners/gradle.ts b/src/build/runners/gradle.ts
+index 2a7ae94..afcc61d 100644
+--- a/src/build/runners/gradle.ts
++++ b/src/build/runners/gradle.ts
+@@ -6,7 +6,6 @@ import type { Runner, TestCase } from '../index.js';
+ import { parseModules, moduleToPath, pathToModule, findGradleCommand } from './gradle/settings.js';
+ import { parseJacocoXml, mergeIstanbulMaps } from './gradle/jacoco.js';
+ import { generateInitScript, detectJacoco } from './gradle/init-script.js';
+-import { ensureListenerJar } from '../../setup/gradle-listener.js';
+ 
+ // Session state — initialised lazily by whichever method is called first
+ let _gradleCmd: string | undefined;
+@@ -272,13 +271,13 @@ function scanJacocoXml(dir: string): string[] {
+   return xmlFiles;
+ }
+ 
+-/** Full Istanbul conversion — used by aggregate() where fnMap/branchMap are needed. */
++/** Full Istanbul conversion — used by both runOne() and aggregate(). */
+ function mergeJacocoDir(dir: string, projectRoot: string): void {
+   fs.mkdirSync(dir, { recursive: true });
+   const xmlFiles = scanJacocoXml(dir);
+ 
+   if (xmlFiles.length === 0) {
+-    process.stderr.write(`  coverage-insights: no jacoco.xml found in ${dir} — aggregate coverage will be empty\n`);
++    process.stderr.write(`  coverage-insights: no jacoco.xml found in ${dir} — coverage will be empty\n`);
+     fs.writeFileSync(path.join(dir, 'coverage-final.json'), '{}', 'utf8');
+     return;
+   }
+@@ -294,7 +293,6 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
+   fs.writeFileSync(path.join(dir, 'coverage-final.json'), JSON.stringify(merged), 'utf8');
+ }
+ 
+-
+ export const gradleRunner: Runner = {
+   // Gradle incurs JVM startup overhead per test; keep concurrency low by default.
+   defaultConcurrency: 2,
+@@ -358,35 +356,31 @@ export const gradleRunner: Runner = {
+     mergeJacocoDir(workerDir, projectRoot);
+   },
+ 
+-  async runAll(projectRoot, workDir) {
++  async runAll(projectRoot: string, workDir: string, testCases?: TestCase[]): Promise<void> {
+     ensureSession(projectRoot);
+-    const gradleCmd = _gradleCmd!;
++    const gradleCmd  = _gradleCmd!;
+     const initScript = _initScriptPath!;
+     fs.mkdirSync(workDir, { recursive: true });
+-    const listenerJar = ensureListenerJar(projectRoot);
+-
+-    // Single test invocation — listener dumps .exec per test
++    // Write filter file so batchConvert only processes the discovered test subset.
++    if (testCases && testCases.length > 0) {
++      const filterNames = testCases.map(tc =>
++        (tc.describePath + '.' + tc.title).replace(/[^a-zA-Z0-9._-]/g, '_'),
++      );
++      fs.writeFileSync(path.join(workDir, '.ci-filter.txt'), filterNames.join('\n'), 'utf8');
++    }
++    // PID-based port avoids conflicts if two coverage-insights processes run simultaneously.
++    const port = 6300 + (process.pid % 1000);
+     await new Promise<void>(resolve => {
+       execFile(gradleCmd, [
+-        'test',
++        ':test',
+         '--no-daemon',
+         '--init-script', initScript,
+         `-Pcoverage.insights.pertest.dir=${workDir}`,
+-        `-Pcoverage.insights.listener.jar=${listenerJar}`,
+-      ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, () => resolve());  // swallow errors — test failures OK
+-    });
+-
+-    // Batch conversion — reads .exec files, writes coverage-final.json
+-    await new Promise<void>((resolve, reject) => {
+-      execFile(gradleCmd, [
+-        'coverageInsightsBatchReport',
+-        '--no-daemon',
+-        '--init-script', initScript,
+-        `-Pcoverage.insights.pertest.dir=${workDir}`,
+-      ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, err => {
+-        if (err) reject(err); else resolve();
+-      });
++        `-Pcoverage.insights.pertest.port=${port}`,
++      ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, () => resolve()); // swallow errors — test failures OK
+     });
++    // batchConvert runs inline in the Gradle process via the TestListener's afterSuite hook,
++    // writing per-test JSON files to workDir. No second Gradle invocation needed.
+   },
+ 
+   async aggregate(projectRoot, aggregateDir, _configPath) {
+diff --git a/src/build/runners/gradle/init-script.ts b/src/build/runners/gradle/init-script.ts
+index ff91fb1..b23e0de 100644
+--- a/src/build/runners/gradle/init-script.ts
++++ b/src/build/runners/gradle/init-script.ts
+@@ -1,15 +1,171 @@
+ import fs from 'fs';
+ import path from 'path';
+ 
++// Top-level helper functions included in all generated init scripts.
++// Defined at script scope so they are callable from within allprojects { } blocks.
++const HELPERS = `
++/** Collect JaCoCo + ASM jars from the buildscript classpath for URLClassLoader use. */
++fun resolveJacocoJars(proj: Project): List<java.io.File> =
++    proj.buildscript.configurations.asMap.values
++        .flatMap { cfg -> try { cfg.resolvedConfiguration.resolvedArtifacts } catch (e: Exception) { emptySet() } }
++        .filter { it.moduleVersion.id.group == "org.jacoco" || it.moduleVersion.id.group == "org.ow2.asm" }
++        .map { it.file }
++        .distinct()
++
++/**
++ * Convert per-test .exec files in pertestDir into per-test .json files.
++ * Each JSON file maps absolute source path to a sorted list of covered line numbers.
++ * Files are processed in parallel using a fixed thread pool.
++ *
++ * If .ci-filter.txt exists in pertestDir, only exec files listed there are processed;
++ * all other exec files are deleted.
++ */
++fun batchConvert(
++    pertestDir: String,
++    classesFiles: org.gradle.api.file.FileCollection,
++    srcDirsSet: Set<java.io.File>,
++    project: Project
++) {
++    val allExecFiles = java.io.File(pertestDir).listFiles { f -> f.extension == "exec" }?.toList() ?: return
++    if (allExecFiles.isEmpty()) return
++
++    val filterFile = java.io.File(pertestDir, ".ci-filter.txt")
++    val testFilter: Set<String>? = if (filterFile.exists()) {
++        try { filterFile.readText().trim().split("\\n").filter { it.isNotEmpty() }.toSet() } catch (e: Exception) { null }
++    } else null
++    val execFiles = if (testFilter != null && testFilter.isNotEmpty()) {
++        allExecFiles.filter { it.nameWithoutExtension in testFilter }
++    } else {
++        allExecFiles.toList()
++    }
++    if (execFiles.isEmpty()) { allExecFiles.forEach { it.delete() }; return }
++    if (testFilter != null) { allExecFiles.forEach { if (it.nameWithoutExtension !in testFilter) it.delete() } }
++
++    val jacocoJars = resolveJacocoJars(project)
++    val cl = try {
++        java.net.URLClassLoader(jacocoJars.map { it.toURI().toURL() }.toTypedArray(), null)
++    } catch (e: Exception) {
++        System.err.println("coverage-insights: batchConvert classloader failed — \${e.message}")
++        return
++    }
++
++    try {
++        val execDataStoreCls    = cl.loadClass("org.jacoco.core.data.ExecutionDataStore")
++        val execFileLoaderCls   = cl.loadClass("org.jacoco.core.tools.ExecFileLoader")
++        val coverageBuilderCls  = cl.loadClass("org.jacoco.core.analysis.CoverageBuilder")
++        val analyzerCls         = cl.loadClass("org.jacoco.core.analysis.Analyzer")
++        val ibundleCls          = cl.loadClass("org.jacoco.core.analysis.IBundleCoverage")
++        val iclassCls           = cl.loadClass("org.jacoco.core.analysis.IClassCoverage")
++        val ilineCls            = cl.loadClass("org.jacoco.core.analysis.ILine")
++        val iCovVisitorCls      = cl.loadClass("org.jacoco.core.analysis.ICoverageVisitor")
++        val iPackageCls         = try { cl.loadClass("org.jacoco.core.analysis.IPackageCoverage") } catch (e: Exception) { null }
++        val mGetExecStore       = execFileLoaderCls.getMethod("getExecutionDataStore")
++        val mLoad               = execFileLoaderCls.getMethod("load", java.io.File::class.java)
++        val mGetBundle          = coverageBuilderCls.getMethod("getBundle", String::class.java)
++        val mGetPackages        = ibundleCls.getMethod("getPackages")
++        val mGetClasses         = iPackageCls?.getMethod("getClasses")
++        val mGetSrcFile         = iclassCls.getMethod("getSourceFileName")
++        val mGetPkgName         = iclassCls.getMethod("getPackageName")
++        val mGetFirstLine       = iclassCls.getMethod("getFirstLine")
++        val mGetLastLine        = iclassCls.getMethod("getLastLine")
++        val mGetLine            = iclassCls.getMethod("getLine", Int::class.java)
++        val mGetStatus          = ilineCls.getMethod("getStatus")
++        val mAnalyzeAll         = analyzerCls.getMethod("analyzeAll", java.io.File::class.java)
++        val analyzerCtor        = analyzerCls.getConstructor(execDataStoreCls, iCovVisitorCls)
++
++        // allSource.srcDirs may be empty at init-script configuration time.
++        // Re-resolve at execution time (when afterSuite calls batchConvert).
++        val resolvedSrcDirs = srcDirsSet.filter { it.exists() }.let {
++            if (it.isNotEmpty()) it
++            else try {
++                project.the<SourceSetContainer>()["main"].allSource.srcDirs.filter { d -> d.exists() }
++            } catch (e: Exception) { it }
++        }
++
++        val threads = minOf(Runtime.getRuntime().availableProcessors(), 8)
++        val pool = java.util.concurrent.Executors.newFixedThreadPool(threads)
++        try {
++            val futures = execFiles.sortedBy { it.name }.map { execFile ->
++                pool.submit(java.util.concurrent.Callable {
++                    try {
++                        val loader  = execFileLoaderCls.getDeclaredConstructor().newInstance()
++                        mLoad.invoke(loader, execFile)
++                        val store   = mGetExecStore.invoke(loader)
++                        val builder = coverageBuilderCls.getDeclaredConstructor().newInstance()
++                        val analyzer = analyzerCtor.newInstance(store, builder)
++                        for (classDir in classesFiles.files) {
++                            if (classDir.exists()) try { mAnalyzeAll.invoke(analyzer, classDir) } catch (e: Exception) {}
++                        }
++                        val bundle = mGetBundle.invoke(builder, "coverage")
++                        val linesByFile = mutableMapOf<String, MutableSet<Int>>()
++                        @Suppress("UNCHECKED_CAST")
++                        for (pkg in (mGetPackages.invoke(bundle) as Collection<Any>)) {
++                            @Suppress("UNCHECKED_CAST")
++                            for (cls in (mGetClasses?.invoke(pkg) as? Collection<Any> ?: emptyList<Any>())) {
++                                val srcFile = mGetSrcFile.invoke(cls) as? String ?: continue
++                                val pkgName = mGetPkgName.invoke(cls) as? String ?: continue
++                                val first   = mGetFirstLine.invoke(cls) as Int
++                                val last    = mGetLastLine.invoke(cls)  as Int
++                                if (first < 0 || last < 0) continue
++                                var absPath: String? = null
++                                for (srcDir in resolvedSrcDirs) {
++                                    val candidate = java.io.File(srcDir, "\$pkgName/\$srcFile")
++                                    if (candidate.exists()) { absPath = candidate.absolutePath; break }
++                                }
++                                if (absPath == null) absPath = "\$pkgName/\$srcFile"
++                                val coveredLines = mutableSetOf<Int>()
++                                for (nr in first..last) {
++                                    val status = mGetStatus.invoke(mGetLine.invoke(cls, nr)) as Int
++                                    if (status >= 2) coveredLines.add(nr)
++                                }
++                                if (coveredLines.isNotEmpty()) linesByFile.getOrPut(absPath) { mutableSetOf() }.addAll(coveredLines)
++                            }
++                        }
++                        if (linesByFile.isNotEmpty()) {
++                            val outFile = java.io.File(pertestDir, "\${execFile.nameWithoutExtension}.json")
++                            java.io.BufferedWriter(java.io.FileWriter(outFile)).use { w ->
++                                w.write("{")
++                                linesByFile.entries.forEachIndexed { i, (p, lines) ->
++                                    // Escape path for JSON (backslash and double-quote)
++                                    val sb = StringBuilder()
++                                    for (ch in p) { when (ch) { '\\\\' -> sb.append("\\\\\\\\"); '"' -> { sb.append('\\\\'); sb.append('"') }; else -> sb.append(ch) } }
++                                    if (i > 0) w.write(",")
++                                    w.write(34); w.write(sb.toString()); w.write(34); w.write(":")
++                                    w.write(lines.sorted().joinToString(",", "[", "]"))
++                                }
++                                w.write("}")
++                            }
++                        }
++                        execFile.delete()
++                    } catch (e: Exception) {
++                        System.err.println("coverage-insights: batchConvert error for \${execFile.name} — \${e.message}")
++                    }
++                })
++            }
++            futures.forEach { it.get() }
++        } finally {
++            pool.shutdown()
++        }
++    } catch (e: Exception) {
++        System.err.println("coverage-insights: batchConvert failed — \${e.message}")
++    } finally {
++        try { cl.close() } catch (e: Exception) {}
++    }
++}
++`;
++
+ const REDIRECT_BLOCK = `
+ allprojects {
+     plugins.withId("jacoco") {
+         tasks.withType<JacocoReport> {
+             val baseDir = providers.gradleProperty("coverage.insights.xmlDir").orNull
+             if (baseDir != null) {
++                // Redirect execution data to the worker-specific file to prevent
++                // concurrent runOne workers clobbering each other's exec output.
++                executionData.setFrom(files("\$baseDir/test.exec"))
+                 reports {
+                     xml.required.set(true)
+-                    xml.outputLocation.set(file("$baseDir/\${project.path.trimStart(':').replace(':', '/')}/jacoco.xml"))
++                    xml.outputLocation.set(file("\$baseDir/\${project.path.trimStart(':').replace(':', '/')}/jacoco.xml"))
+                 }
+             }
+         }
+@@ -17,6 +173,7 @@ allprojects {
+             outputs.upToDateWhen { false }
+             jvmArgs("-XX:TieredStopAtLevel=1")
+             val pertestDir = providers.gradleProperty("coverage.insights.pertest.dir").orNull
++<<<<<<< Updated upstream
+             val jsonDir    = providers.gradleProperty("coverage.insights.jsonDir").orNull
+             if (pertestDir != null) {
+                 val listenerJar = providers.gradleProperty("coverage.insights.listener.jar").orNull
+@@ -45,6 +202,67 @@ allprojects {
+                     )
+                 }
+             }
++=======
++            val xmlDir     = providers.gradleProperty("coverage.insights.xmlDir").orNull
++            if (pertestDir != null) {
++                // Batch mode: run as TCP server; dump per-test exec via ExecDumpClient after each test.
++                val port = (providers.gradleProperty("coverage.insights.pertest.port").orNull ?: "6300").toInt()
++                extensions.configure<JacocoTaskExtension> {
++                    output = JacocoTaskExtension.Output.TCP_SERVER
++                    this.port = port
++                }
++                val classesFiles = project.the<SourceSetContainer>()["main"].output.classesDirs
++                val srcDirsSet   = project.the<SourceSetContainer>()["main"].allSource.srcDirs
++                val jacocoJars   = resolveJacocoJars(project)
++                addTestListener(object : TestListener {
++                    var cl: java.net.URLClassLoader? = null
++                    override fun beforeSuite(suite: TestDescriptor) {
++                        if (suite.parent != null) return
++                        try {
++                            cl = java.net.URLClassLoader(jacocoJars.map { it.toURI().toURL() }.toTypedArray(), null)
++                        } catch (e: Exception) {
++                            System.err.println("coverage-insights: URLClassLoader init failed — \${e.message}")
++                        }
++                    }
++                    override fun beforeTest(d: TestDescriptor) {}
++                    override fun afterTest(d: TestDescriptor, r: TestResult) {
++                        val loader = cl ?: return
++                        var lastEx: Exception? = null
++                        for (attempt in 0..2) {
++                            try {
++                                if (attempt > 0) Thread.sleep(100L * attempt)
++                                val cCls = loader.loadClass("org.jacoco.core.tools.ExecDumpClient")
++                                val c    = cCls.getDeclaredConstructor().newInstance()
++                                cCls.getMethod("setReset", Boolean::class.java).invoke(c, true)
++                                try { cCls.getMethod("setRetryCount", Int::class.java).invoke(c, 0) } catch (e: Exception) {}
++                                val dumped = cCls.getMethod("dump", String::class.java, Int::class.java).invoke(c, "localhost", port)
++                                val name   = "\${d.className}.\${d.name}".replace(Regex("[^a-zA-Z0-9._-]"), "_")
++                                val lCls   = loader.loadClass("org.jacoco.core.tools.ExecFileLoader")
++                                lCls.getMethod("save", java.io.File::class.java, Boolean::class.java)
++                                    .invoke(dumped, java.io.File(pertestDir, "\$name.exec"), false)
++                                return
++                            } catch (e: Exception) { lastEx = e }
++                        }
++                        val cause = (lastEx as? java.lang.reflect.InvocationTargetException)?.targetException ?: lastEx
++                        System.err.println("coverage-insights: dump failed for \${d.className}.\${d.name} — \${cause?.javaClass?.simpleName}: \${cause?.message}")
++                    }
++                    override fun afterSuite(suite: TestDescriptor, r: TestResult) {
++                        if (suite.parent != null) return
++                        try { cl?.close() } catch (e: Exception) {}
++                        cl = null
++                        batchConvert(pertestDir, classesFiles, srcDirsSet, project)
++                    }
++                })
++            } else {
++                // Per-test (runOne) mode: redirect exec file to worker-specific dir.
++                if (xmlDir != null) {
++                    extensions.configure<JacocoTaskExtension> {
++                        destinationFile = file("\$xmlDir/test.exec")
++                    }
++                }
++                finalizedBy("jacocoTestReport")
++            }
++>>>>>>> Stashed changes
+         }
+     }
+ }
+@@ -199,14 +417,12 @@ const INJECTION_BLOCK = `
+ allprojects {
+     pluginManager.withPlugin("java") {
+         apply(plugin = "jacoco")
+-        val testTask = tasks.findByName("test") ?: return@withPlugin
+-        val reportTask = tasks.maybeCreate("jacocoTestReport", JacocoReport::class.java).apply {
+-            dependsOn(testTask)
+-            executionData(testTask)
+-            sourceSets(the<SourceSetContainer>()["main"])
+-        }
++        val testTask = tasks.findByName("test") as? Test ?: return@withPlugin
++        val pertestDir = providers.gradleProperty("coverage.insights.pertest.dir").orNull
++        val xmlDir     = providers.gradleProperty("coverage.insights.xmlDir").orNull
+         testTask.outputs.upToDateWhen { false }
+         testTask.jvmArgs("-XX:TieredStopAtLevel=1")
++<<<<<<< Updated upstream
+         val pertestDir = providers.gradleProperty("coverage.insights.pertest.dir").orNull
+         val jsonDir    = providers.gradleProperty("coverage.insights.jsonDir").orNull
+         if (pertestDir != null) {
+@@ -234,13 +450,83 @@ allprojects {
+                     )
+                 }
+             }
++=======
++        if (pertestDir != null) {
++            val port = (providers.gradleProperty("coverage.insights.pertest.port").orNull ?: "6300").toInt()
++            testTask.extensions.configure<JacocoTaskExtension> {
++                output = JacocoTaskExtension.Output.TCP_SERVER
++                this.port = port
++            }
++            val classesFiles = project.the<SourceSetContainer>()["main"].output.classesDirs
++            val srcDirsSet   = project.the<SourceSetContainer>()["main"].allSource.srcDirs
++            val jacocoJars   = resolveJacocoJars(project)
++            testTask.addTestListener(object : TestListener {
++                var cl: java.net.URLClassLoader? = null
++                override fun beforeSuite(suite: TestDescriptor) {
++                    if (suite.parent != null) return
++                    try {
++                        cl = java.net.URLClassLoader(jacocoJars.map { it.toURI().toURL() }.toTypedArray(), null)
++                    } catch (e: Exception) {
++                        System.err.println("coverage-insights: URLClassLoader init failed — \${e.message}")
++                    }
++                }
++                override fun beforeTest(d: TestDescriptor) {}
++                override fun afterTest(d: TestDescriptor, r: TestResult) {
++                    val loader = cl ?: return
++                    var lastEx: Exception? = null
++                    for (attempt in 0..2) {
++                        try {
++                            if (attempt > 0) Thread.sleep(100L * attempt)
++                            val cCls = loader.loadClass("org.jacoco.core.tools.ExecDumpClient")
++                            val c    = cCls.getDeclaredConstructor().newInstance()
++                            cCls.getMethod("setReset", Boolean::class.java).invoke(c, true)
++                            try { cCls.getMethod("setRetryCount", Int::class.java).invoke(c, 0) } catch (e: Exception) {}
++                            val dumped = cCls.getMethod("dump", String::class.java, Int::class.java).invoke(c, "localhost", port)
++                            val name   = "\${d.className}.\${d.name}".replace(Regex("[^a-zA-Z0-9._-]"), "_")
++                            val lCls   = loader.loadClass("org.jacoco.core.tools.ExecFileLoader")
++                            lCls.getMethod("save", java.io.File::class.java, Boolean::class.java)
++                                .invoke(dumped, java.io.File(pertestDir, "\$name.exec"), false)
++                            return
++                        } catch (e: Exception) { lastEx = e }
++                    }
++                    val cause = (lastEx as? java.lang.reflect.InvocationTargetException)?.targetException ?: lastEx
++                    System.err.println("coverage-insights: dump failed for \${d.className}.\${d.name} — \${cause?.javaClass?.simpleName}: \${cause?.message}")
++                }
++                override fun afterSuite(suite: TestDescriptor, r: TestResult) {
++                    if (suite.parent != null) return
++                    try { cl?.close() } catch (e: Exception) {}
++                    cl = null
++                    batchConvert(pertestDir, classesFiles, srcDirsSet, project)
++                }
++            })
++        } else {
++            val reportTask = tasks.maybeCreate("jacocoTestReport", JacocoReport::class.java).apply {
++                dependsOn(testTask)
++                sourceSets(the<SourceSetContainer>()["main"])
++                if (xmlDir != null) {
++                    executionData.setFrom(files("\$xmlDir/test.exec"))
++                    reports {
++                        xml.required.set(true)
++                        xml.outputLocation.set(file("\$xmlDir/\${project.path.trimStart(':').replace(':', '/')}/jacoco.xml"))
++                    }
++                } else {
++                    executionData(testTask)
++                }
++            }
++            if (xmlDir != null) {
++                testTask.extensions.configure<JacocoTaskExtension> {
++                    destinationFile = file("\$xmlDir/test.exec")
++                }
++            }
++            testTask.finalizedBy(reportTask)
++>>>>>>> Stashed changes
+         }
+     }
+ }`;
+ 
+ /** Generate content for the JaCoCo Gradle init script. */
+ export function generateInitScript(injection: boolean): string {
+-  return injection ? INJECTION_BLOCK + '\n' + REDIRECT_BLOCK : REDIRECT_BLOCK;
++  return HELPERS + (injection ? INJECTION_BLOCK + '\n' + REDIRECT_BLOCK : REDIRECT_BLOCK);
+ }
+ 
+ /** Return true if any build file in the project mentions jacoco. */
+diff --git a/src/build/runners/play.ts b/src/build/runners/play.ts
+new file mode 100644
+index 0000000..c39e06d
+--- /dev/null
++++ b/src/build/runners/play.ts
+@@ -0,0 +1,95 @@
++import fs from 'fs';
++import path from 'path';
++import type { Runner, TestCase } from '../index.js';
++import { gradleRunner } from './gradle.js';
++import { discoverITestCases, type PlayITestCase } from './play/itest-analysis.js';
++
++function isITest(tc: TestCase): tc is PlayITestCase {
++  return tc.filePath.endsWith('ITest.java');
++}
++
++/**
++ * Play Framework runner — wraps the Gradle runner and adds:
++ * - ITest discovery via static route + import analysis
++ * - Static coverage estimation for ITests (no Gradle invocation needed)
++ * Dead controller detection is available via analyseControllers() for companion scripts.
++ */
++export const playRunner: Runner = {
++  defaultConcurrency: gradleRunner.defaultConcurrency,
++
++  async discover(projectRoot, fileFilter, configPath) {
++    // Real UTest cases from Gradle source scanning
++    const uTestCases = await gradleRunner.discover(projectRoot, fileFilter, configPath);
++    // ITest cases via static analysis of *ITest.java files + routes
++    const iTestCases = discoverITestCases(projectRoot, fileFilter);
++    return [...uTestCases, ...iTestCases];
++  },
++
++  async runOne(tc, projectRoot, workerDir, configPath) {
++    if (isITest(tc)) {
++      // ITests can't run in isolation — write static coverage instead
++      fs.mkdirSync(workerDir, { recursive: true });
++      writeStaticCoverage(tc, workerDir, projectRoot);
++    } else {
++      await gradleRunner.runOne(tc, projectRoot, workerDir, configPath);
++    }
++  },
++
++  async runAll(projectRoot, workDir, testCases) {
++    // Split: UTests via Gradle batch, ITests via static analysis
++    const uTests = testCases?.filter(tc => !isITest(tc));
++    const iTests = testCases?.filter(isITest) ?? [];
++
++    // Run Gradle batch for UTests (non-empty only — Gradle errors on no tests)
++    if (uTests && uTests.length > 0) {
++      await gradleRunner.runAll!(projectRoot, workDir, uTests);
++    }
++
++    // Write static coverage JSON for each ITest method directly into workDir
++    for (const tc of iTests) {
++      const key = (tc.describePath + '.' + tc.title).replace(/[^a-zA-Z0-9._-]/g, '_');
++      const outFile = path.join(workDir, `${key}.json`);
++      const coverage = buildStaticCoverageMap(tc, projectRoot);
++      if (Object.keys(coverage).length > 0) {
++        fs.writeFileSync(outFile, JSON.stringify(coverage), 'utf8');
++      }
++    }
++  },
++
++  aggregate: gradleRunner.aggregate,
++};
++
++/** Build a compact coverage map { [absPath]: lineNumbers[] } from static targets. */
++function buildStaticCoverageMap(tc: PlayITestCase, projectRoot: string): Record<string, number[]> {
++  const coverage: Record<string, number[]> = {};
++  for (const target of tc.staticTargets ?? []) {
++    const absPath = path.isAbsolute(target) ? target : path.join(projectRoot, target);
++    if (!fs.existsSync(absPath)) continue;
++    // Estimate: mark all non-blank, non-comment lines as "covered"
++    const lines = estimateCoveredLines(absPath);
++    if (lines.length > 0) coverage[absPath] = lines;
++  }
++  return coverage;
++}
++
++/** Write a coverage-final.json for an ITest into workerDir. */
++function writeStaticCoverage(tc: PlayITestCase, workerDir: string, projectRoot: string): void {
++  const coverage = buildStaticCoverageMap(tc, projectRoot);
++  fs.writeFileSync(path.join(workerDir, 'coverage-final.json'), JSON.stringify(coverage), 'utf8');
++}
++
++/** Return line numbers that are likely executable (non-blank, non-comment, non-brace-only). */
++function estimateCoveredLines(filePath: string): number[] {
++  const lines: number[] = [];
++  try {
++    const content = fs.readFileSync(filePath, 'utf8').split('\n');
++    for (let i = 0; i < content.length; i++) {
++      const trimmed = content[i].trim();
++      if (!trimmed) continue;
++      if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) continue;
++      if (trimmed === '{' || trimmed === '}' || trimmed === '};') continue;
++      lines.push(i + 1);
++    }
++  } catch { /* ignore */ }
++  return lines;
++}
+diff --git a/src/build/runners/play/dead-controllers.ts b/src/build/runners/play/dead-controllers.ts
+new file mode 100644
+index 0000000..60cc0f2
+--- /dev/null
++++ b/src/build/runners/play/dead-controllers.ts
+@@ -0,0 +1,98 @@
++import fs from 'fs';
++import path from 'path';
++import { parseRoutes } from './routes.js';
++
++export type ControllerStatus = 'routed' | 'view-referenced' | 'java-referenced' | 'test-only' | 'unreferenced';
++
++export interface ControllerResult {
++  relativePath: string;
++  simpleName:   string;
++  status:       ControllerStatus;
++  refs: {
++    inRoutes:     boolean;
++    inViews:      boolean;
++    inJava:       boolean;
++    inTests:      boolean;
++  };
++}
++
++function escapeRegex(s: string): string {
++  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++}
++
++function walk(dir: string, ext: string, results: string[] = []): string[] {
++  try {
++    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
++      const full = path.join(dir, entry.name);
++      if (entry.isDirectory()) walk(full, ext, results);
++      else if (entry.isFile() && entry.name.endsWith(ext)) results.push(full);
++    }
++  } catch { /* ignore */ }
++  return results;
++}
++
++function readAll(files: string[]): string {
++  return files.map(f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } }).join('\n');
++}
++
++/**
++ * Analyse all controllers under app/controllers/ in projectRoot.
++ * Returns one ControllerResult per concrete controller class.
++ */
++export function analyseControllers(projectRoot: string): ControllerResult[] {
++  const controllersDir = path.join(projectRoot, 'app', 'controllers');
++  const appDir         = path.join(projectRoot, 'app');
++  const testDir        = path.join(projectRoot, 'test');
++  const viewsDir       = path.join(projectRoot, 'app', 'views');
++  const routesPath     = path.join(projectRoot, 'conf', 'routes');
++
++  if (!fs.existsSync(controllersDir)) return [];
++
++  const routes = fs.existsSync(routesPath) ? parseRoutes(routesPath) : [];
++  const routesText = fs.existsSync(routesPath) ? fs.readFileSync(routesPath, 'utf8') : '';
++  const viewsText  = readAll(walk(viewsDir,      '.html'));
++  const javaText   = readAll(walk(appDir,        '.java').filter(f => !f.includes('/controllers/')));
++  const testText   = readAll(walk(testDir,       '.java'));
++
++  const ctrlFiles = walk(controllersDir, '.java');
++  const results: ControllerResult[] = [];
++
++  for (const filePath of ctrlFiles) {
++    const content = fs.readFileSync(filePath, 'utf8');
++    const isAbstract = /\babstract\s+class\b/.test(content) || /\binterface\b/.test(content);
++    if (isAbstract) continue;
++
++    const simpleName  = path.basename(filePath, '.java');
++    const relPath     = path.relative(path.join(projectRoot, 'app'), filePath).replace(/\\/g, '/');
++    const relativePath = 'app/' + relPath;
++
++    // Routes: look for "SimpleClassName.action" or FQN-based reference
++    const routeRef = relPath.replace(/\.java$/, '').replace(/\//g, '.');
++    const routePattern  = new RegExp(`\\b${escapeRegex(routeRef.replace(/^controllers\./, ''))}\\.\\w+`);
++    const inRoutes = routePattern.test(routesText) ||
++      routes.some(r => r.controllerFqn.endsWith(simpleName));
++
++    // Views: @{ControllerName.action()}
++    const viewPattern = new RegExp(`@\\{[\\w.]*${escapeRegex(simpleName)}\\.`);
++    const inViews = viewPattern.test(viewsText);
++
++    // Non-controller Java source
++    const javaPattern = new RegExp(`\\b${escapeRegex(simpleName)}[.\\s(]`);
++    const inJava = javaPattern.test(javaText);
++
++    // Test files
++    const testPattern = new RegExp(`\\b${escapeRegex(simpleName)}\\b`);
++    const inTests = testPattern.test(testText);
++
++    let status: ControllerStatus;
++    if (inRoutes)     status = 'routed';
++    else if (inViews) status = 'view-referenced';
++    else if (inJava)  status = 'java-referenced';
++    else if (inTests) status = 'test-only';
++    else              status = 'unreferenced';
++
++    results.push({ relativePath, simpleName, status, refs: { inRoutes, inViews, inJava, inTests } });
++  }
++
++  return results;
++}
+diff --git a/src/build/runners/play/itest-analysis.ts b/src/build/runners/play/itest-analysis.ts
+new file mode 100644
+index 0000000..139920b
+--- /dev/null
++++ b/src/build/runners/play/itest-analysis.ts
+@@ -0,0 +1,123 @@
++import fs from 'fs';
++import path from 'path';
++import type { TestCase } from '../../index.js';
++import { parseRoutes, matchRoute, type Route } from './routes.js';
++
++export interface PlayITestCase extends TestCase {
++  file: string;
++  staticTargets: string[];
++}
++
++/** Recursively find all *ITest.java files under dir. */
++function findITestFiles(dir: string, results: string[] = []): string[] {
++  try {
++    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
++      const full = path.join(dir, entry.name);
++      if (entry.isDirectory()) findITestFiles(full, results);
++      else if (entry.isFile() && entry.name.endsWith('ITest.java')) results.push(full);
++    }
++  } catch { /* ignore */ }
++  return results;
++}
++
++/** Extract public void test*() method names from a Java class body. */
++function extractTestMethods(content: string): string[] {
++  const methods: string[] = [];
++  // Match "public void testFoo()" style (Play 1.x ITests don't use @Test)
++  for (const m of content.matchAll(/\bpublic\s+void\s+(test\w+)\s*\(/g)) {
++    methods.push(m[1]);
++  }
++  return methods;
++}
++
++/** Resolve a controller FQN to a source file path under app/. */
++function resolveController(controllerFqn: string, appDir: string): string | null {
++  // e.g. "controllers.HomeController" → "app/controllers/HomeController.java"
++  const relPath = controllerFqn.replace(/\./g, '/') + '.java';
++  const direct = path.join(appDir, relPath);
++  if (fs.existsSync(direct)) return direct;
++
++  // Strip leading "controllers." prefix
++  const stripped = controllerFqn.replace(/^controllers\./, '');
++  const fallback = path.join(appDir, 'controllers', stripped.replace(/\./g, '/') + '.java');
++  if (fs.existsSync(fallback)) return fallback;
++
++  return null;
++}
++
++/** Extract url("seg1","seg2",...) call segments from EndpointTest body. */
++function extractUrlSegments(content: string): string[][] {
++  const results: string[][] = [];
++  for (const m of content.matchAll(/\burl\s*\(([^)]+)\)/g)) {
++    const segs: string[] = [];
++    for (const s of m[1].matchAll(/"([^"]+)"/g)) segs.push(s[1]);
++    if (segs.length > 0) results.push(segs);
++  }
++  return results;
++}
++
++/** Check if the content is an EndpointTest subclass (direct or indirect via common base names). */
++function isEndpointTest(content: string): boolean {
++  return /extends\s+(EndpointTest|BaseEndpointTest)\b/.test(content);
++}
++
++/**
++ * Discover Play ITest files and produce TestCase entries with static source targets.
++ * Each @Test-style method becomes its own TestCase; staticTargets lists source files
++ * estimated to be exercised based on routes and imports.
++ */
++export function discoverITestCases(projectRoot: string, fileFilter?: string): PlayITestCase[] {
++  const testDir = path.join(projectRoot, 'test');
++  const appDir  = path.join(projectRoot, 'app');
++  const routesPath = path.join(projectRoot, 'conf', 'routes');
++
++  const routes: Route[] = fs.existsSync(routesPath) ? parseRoutes(routesPath) : [];
++
++  const iTestFiles = findITestFiles(testDir);
++  const cases: PlayITestCase[] = [];
++
++  for (const filePath of iTestFiles) {
++    if (fileFilter && !filePath.includes(fileFilter)) continue;
++
++    const content = fs.readFileSync(filePath, 'utf8');
++    const packageMatch = content.match(/^package\s+([\w.]+)\s*;/m);
++    const packageName = packageMatch ? packageMatch[1] : '';
++    const classMatch  = content.match(/public\s+class\s+(\w+)/);
++    if (!classMatch) continue;
++    const className = classMatch[1];
++    const fqcn = packageName ? `${packageName}.${className}` : className;
++
++    const methods = extractTestMethods(content);
++    if (methods.length === 0) continue;
++
++    // Static targets — controllers reached via url() for EndpointTests
++    const staticTargets: string[] = [];
++    const seen = new Set<string>();
++
++    function addTarget(p: string | null) {
++      if (!p || seen.has(p)) return;
++      seen.add(p);
++      staticTargets.push(p);
++    }
++
++    if (isEndpointTest(content)) {
++      for (const segs of extractUrlSegments(content)) {
++        const route = matchRoute(segs, routes);
++        if (route) addTarget(resolveController(route.controllerFqn, appDir));
++      }
++    }
++
++    for (const title of methods) {
++      cases.push({
++        filePath,
++        file:        filePath,
++        fullName:    `${fqcn} > ${title}`,
++        title,
++        describePath: fqcn,
++        staticTargets: [...staticTargets],
++      });
++    }
++  }
++
++  return cases;
++}
+diff --git a/src/build/runners/play/routes.ts b/src/build/runners/play/routes.ts
+new file mode 100644
+index 0000000..7500215
+--- /dev/null
++++ b/src/build/runners/play/routes.ts
+@@ -0,0 +1,78 @@
++import fs from 'fs';
++
++export interface Route {
++  method: string;
++  urlPattern: string;
++  controllerFqn: string;
++  action: string;
++}
++
++/** Parse a Play 1.x conf/routes file into Route entries. */
++export function parseRoutes(routesPath: string): Route[] {
++  const lines = fs.readFileSync(routesPath, 'utf8').split('\n');
++  const routes: Route[] = [];
++
++  for (const line of lines) {
++    const trimmed = line.trim();
++    if (!trimmed || trimmed.startsWith('#')) continue;
++
++    const parts = trimmed.split(/\s+/);
++    if (parts.length < 3) continue;
++
++    const method = parts[0];
++    if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', '*'].includes(method)) continue;
++
++    const urlPattern = parts[1];
++    const handlerRaw = parts[2].split('(')[0]; // strip query-param signature
++
++    // Skip static asset routes
++    if (handlerRaw.startsWith('staticDir:') || handlerRaw.startsWith('staticFile:')) continue;
++
++    const lastDot = handlerRaw.lastIndexOf('.');
++    if (lastDot < 0) continue;
++
++    const controllerFqn = handlerRaw.slice(0, lastDot);
++    const action = handlerRaw.slice(lastDot + 1);
++
++    routes.push({ method, urlPattern, controllerFqn, action });
++  }
++
++  return routes;
++}
++
++/**
++ * Given URL path segments (e.g. ["admin", "users"]), find the best matching route.
++ * Returns null if no route matches.
++ */
++export function matchRoute(segments: string[], routes: Route[]): Route | null {
++  let best: Route | null = null;
++  let bestScore = -1;
++
++  for (const route of routes) {
++    const routeSegs = route.urlPattern.split('/').filter(s => s.length > 0);
++    if (routeSegs.length < segments.length) continue;
++
++    let score = 0;
++    let mismatch = false;
++    for (let i = 0; i < segments.length; i++) {
++      const rSeg = routeSegs[i];
++      const uSeg = segments[i];
++      if (!rSeg) { mismatch = true; break; }
++      if (rSeg === uSeg) {
++        score += 2; // exact match
++      } else if (rSeg.startsWith('{') || rSeg.startsWith('<') || rSeg === '*') {
++        score += 1; // wildcard
++      } else {
++        mismatch = true;
++        break;
++      }
++    }
++
++    if (!mismatch && score > bestScore) {
++      bestScore = score;
++      best = route;
++    }
++  }
++
++  return best;
++}
+diff --git a/src/cli.ts b/src/cli.ts
+index 90082f4..1ffd6ea 100644
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -1,20 +1,32 @@
+ #!/usr/bin/env node
+ import path from 'path';
+ import fs from 'fs';
++import { execFileSync, spawn } from 'child_process';
+ import { build } from './build/index.js';
+ import { vitestRunner } from './build/runners/vitest.js';
+ import { jestRunner } from './build/runners/jest.js';
+ import { gradleRunner } from './build/runners/gradle.js';
++import { playRunner } from './build/runners/play.js';
++import { analyseControllers } from './build/runners/play/dead-controllers.js';
+ import { detectRunner } from './build/detect.js';
+ import { analyse } from './analyse.js';
+ import { consoleReport } from './report/console.js';
+ import { htmlReport } from './report/html.js';
+ import type { AnalysisOptions } from './types.js';
++import type { PlayReportData } from './report/html.js';
++
++function openFile(filePath: string): void {
++  spawn('open', [filePath], { detached: true, stdio: 'ignore' }).unref();
++}
+ 
+ function parseArgs(argv: string[]): {
+   root: string;
+   outDir: string;
+   html: boolean;
++  noBuild: boolean;
++  noAggregate: boolean;
++  openHtml: boolean;
++  companion?: string;
+   opts: AnalysisOptions;
+   concurrency: number | undefined;
+   fileFilter?: string;
+@@ -25,7 +37,6 @@ function parseArgs(argv: string[]): {
+   const get = (prefix: string): string | undefined => {
+     const withEq = args.find(a => a.startsWith(prefix));
+     if (withEq !== undefined) return withEq.split('=').slice(1).join('=');
+-    // Also handle space-separated form: --flag value
+     const bare = prefix.replace(/=$/, '');
+     const idx  = args.indexOf(bare);
+     if (idx >= 0 && idx + 1 < args.length && !args[idx + 1].startsWith('-')) return args[idx + 1];
+@@ -35,11 +46,17 @@ function parseArgs(argv: string[]): {
+   const root        = path.resolve(get('--root=')        ?? process.cwd());
+   const outDir      = path.resolve(root, get('--out=')   ?? 'coverage-insights');
+   const html        = !args.includes('--no-html');
++  const noBuild     = args.includes('--no-build');
+   const fileFilter  = get('--file=');
++  const runnerFlag  = get('--runner=');
++  // Play runner skips aggregate by default — ITests can't run in isolation so
++  // the aggregate JaCoCo pass adds noise without meaningful signal.
++  const noAggregate = args.includes('--no-aggregate') || fileFilter !== undefined || runnerFlag === 'play';
++  const openHtml    = !args.includes('--no-open');
++  const companion   = get('--companion=') ? path.resolve(get('--companion=')!) : undefined;
+   const configPath  = get('--config=') ? path.resolve(get('--config=')!) : undefined;
+   const rawConc     = get('--concurrency=');
+   const concurrency = rawConc !== undefined ? parseInt(rawConc, 10) : undefined;
+-  const runnerFlag  = get('--runner=');
+ 
+   const opts: AnalysisOptions = {
+     threshold:            parseFloat(get('--threshold=')    ?? '0.9'),
+@@ -48,25 +65,44 @@ function parseArgs(argv: string[]): {
+     topN:                 get('--top=') ? parseInt(get('--top=')!, 10) : undefined,
+   };
+ 
+-  return { root, outDir, html, opts, concurrency, fileFilter, configPath, runnerFlag };
++  return { root, outDir, html, noBuild, noAggregate, openHtml, companion, opts, concurrency, fileFilter, configPath, runnerFlag };
+ }
+ 
+ export async function main(): Promise<void> {
+-  const { root, outDir, html, opts, concurrency, fileFilter, configPath, runnerFlag } = parseArgs(process.argv);
++  const { root, outDir, html, noBuild, noAggregate, openHtml, companion, opts, concurrency, fileFilter, configPath, runnerFlag } = parseArgs(process.argv);
+ 
+   if (!fs.existsSync(root)) {
+     process.stderr.write(`Error: project root does not exist: ${root}\n`);
+     process.exit(1);
+   }
+ 
+-  process.stdout.write(`coverage-insights: scanning ${root}\n`);
+-
+-  const runnerName = detectRunner(root, runnerFlag);
+-  const runner = runnerName === 'jest' ? jestRunner
+-               : runnerName === 'gradle' ? gradleRunner
+-               : vitestRunner;
++  let map: Awaited<ReturnType<typeof build>>['map'];
++  let summary: Awaited<ReturnType<typeof build>>['summary'];
+ 
+-  const { map, summary } = await build({ projectRoot: root, outDir, concurrency, fileFilter, configPath }, runner);
++  if (noBuild) {
++    // Load existing test-line-map.json without re-running tests
++    const mapPath = path.join(outDir, 'test-line-map.json');
++    if (!fs.existsSync(mapPath)) {
++      process.stderr.write(`Error: no test-line-map.json found at ${mapPath}\n`);
++      process.stderr.write(`Run without --no-build first to collect coverage data.\n`);
++      process.exit(1);
++    }
++    process.stdout.write(`coverage-insights: loading existing data from ${outDir}\n`);
++    map     = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
++    summary = {};
++    const summaryPath = path.join(outDir, 'coverage-summary.json');
++    if (fs.existsSync(summaryPath)) {
++      summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
++    }
++  } else {
++    process.stdout.write(`coverage-insights: scanning ${root}\n`);
++    const runnerName = detectRunner(root, runnerFlag);
++    const runner = runnerName === 'jest'   ? jestRunner
++                 : runnerName === 'gradle' ? gradleRunner
++                 : runnerName === 'play'   ? playRunner
++                 : vitestRunner;
++    ({ map, summary } = await build({ projectRoot: root, outDir, concurrency, noAggregate, fileFilter, configPath }, runner));
++  }
+ 
+   const report = analyse(map, summary, opts);
+   consoleReport(report, opts);
+@@ -74,10 +110,16 @@ export async function main(): Promise<void> {
+   const jsonPath = path.join(outDir, 'test-line-map.json');
+   process.stdout.write(`\n  JSON  ${jsonPath}\n`);
+ 
++  let playData: PlayReportData | undefined;
++  if (detectRunner(root, runnerFlag) === 'play') {
++    playData = { controllers: analyseControllers(root) };
++  }
++
++  let htmlPath: string | undefined;
+   if (html) {
+-    const htmlContent = htmlReport(report, opts);
++    const htmlContent = htmlReport(report, opts, playData);
+     fs.mkdirSync(outDir, { recursive: true });
+-    const htmlPath = path.join(outDir, 'report.html');
++    htmlPath = path.join(outDir, 'report.html');
+     fs.writeFileSync(htmlPath, htmlContent, 'utf8');
+     process.stdout.write(`  HTML  ${htmlPath}\n`);
+   }
+@@ -85,6 +127,32 @@ export async function main(): Promise<void> {
+   for (const dir of ['tmp-per-test', 'aggregate']) {
+     fs.rmSync(path.join(outDir, dir), { recursive: true, force: true });
+   }
++
++  // Run companion script if provided — passes outDir and map path as arguments.
++  // The companion can generate supplementary reports, run project-specific analysis,
++  // or produce a combined HTML output.
++  if (companion) {
++    if (!fs.existsSync(companion)) {
++      process.stderr.write(`Warning: companion script not found: ${companion}\n`);
++    } else {
++      process.stderr.write(`\n▶ Running companion: ${companion}\n`);
++      try {
++        execFileSync(process.execPath, [
++          companion,
++          `--out=${outDir}`,
++          `--map=${jsonPath}`,
++        ], { stdio: 'inherit' });
++      } catch {
++        process.stderr.write(`Warning: companion script exited with an error.\n`);
++      }
++    }
++  }
++
++  // Auto-open HTML — companion may have replaced report.html with a combined version
++  if (openHtml) {
++    const toOpen = htmlPath ?? path.join(outDir, 'report.html');
++    if (fs.existsSync(toOpen)) openFile(toOpen);
++  }
+ }
+ 
+ if (require.main === module) {
+diff --git a/src/report/html.ts b/src/report/html.ts
+index e9a064e..98a3e2d 100644
+--- a/src/report/html.ts
++++ b/src/report/html.ts
+@@ -1,5 +1,25 @@
+ import type { AnalysisReport, AnalysisOptions } from '../types.js';
+ 
++export interface PlayControllerEntry {
++  relativePath: string;
++  simpleName:   string;
++  status:       'routed' | 'view-referenced' | 'java-referenced' | 'test-only' | 'unreferenced';
++  refs: { inRoutes: boolean; inViews: boolean; inJava: boolean; inTests: boolean };
++}
++
++export interface PlayReportData {
++  controllers: PlayControllerEntry[];
++}
++
++interface Row {
++  cat:      string;
++  catLabel: string;
++  catColor: string;
++  subject:  string; // plain text — escaped on render
++  detail:   string; // HTML-ready (may contain badge markup)
++  rec:      string; // plain text — escaped on render
++}
++
+ function esc(s: string | number): string {
+   return String(s)
+     .replace(/&/g, '&amp;')
+@@ -8,275 +28,162 @@ function esc(s: string | number): string {
+     .replace(/"/g, '&quot;');
+ }
+ 
+-function table(headers: string[], rows: string[][]): string {
+-  if (rows.length === 0) return '<p class="none">No findings.</p>';
+-  const th = headers.map(h => `<th>${esc(h)}</th>`).join('');
+-  const trs = rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('\n');
+-  return `<table><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>`;
++function badge(label: string, color: string): string {
++  return `<span class="badge badge-${color}">${esc(label)}</span>`;
+ }
+ 
+-function badge(label: string, type: 'blue' | 'indigo' | 'red' | 'amber' | 'grey'): string {
+-  return `<span class="badge badge-${type}">${esc(label)}</span>`;
++function overlapRec(aLines: number, bLines: number, sharedLines: number, jaccard: number): string {
++  if (aLines === sharedLines && bLines > sharedLines) return 'A is entirely inside B. Consider removing A.';
++  if (bLines === sharedLines && aLines > sharedLines) return 'B is entirely inside A. Consider removing B.';
++  return `Significant overlap (${(jaccard * 100).toFixed(1)}%). Investigate before removing either.`;
+ }
+ 
+-function actionBadge(action: string): string {
+-  if (action === 'it.each')           return badge('it.each', 'blue');
+-  if (action === 'merge-assertions')  return badge('merge-assertions', 'indigo');
+-  if (action.startsWith('delete'))    return badge(action, 'red');
+-  if (action === 'add test')          return badge('add test', 'amber');
+-  if (action === 'check')             return badge('check', 'amber');
+-  return badge('investigate', 'grey');
++function deadStatusBadge(status: PlayControllerEntry['status']): string {
++  if (status === 'unreferenced')    return badge('unreferenced', 'red');
++  if (status === 'test-only')       return badge('test-only', 'amber');
++  if (status === 'view-referenced') return badge('view-referenced', 'grey');
++  return badge('java-referenced', 'grey');
+ }
+ 
+-function badgeGuide(items: Array<{ action: string; desc: string; count: number }>): string {
+-  const parts = items.map(({ action, desc, count }) =>
+-    `${actionBadge(action)} <span class="guide-text">${esc(desc)} <strong>(${count})</strong></span>`,
+-  );
+-  return `<p class="badge-guide">${parts.join('')}</p>`;
++function deadRec(status: PlayControllerEntry['status']): string {
++  if (status === 'unreferenced')    return 'No routes, views, or code references found. Consider removing.';
++  if (status === 'test-only')       return 'Referenced only in tests. Verify it is not a forgotten feature.';
++  if (status === 'view-referenced') return 'Referenced in views but not routes. Check for direct template calls.';
++  return 'Referenced in non-controller Java. Check usage before removing.';
+ }
+ 
+-function tips(items: string[]): string {
+-  if (items.length === 0) return '';
+-  const li = items.map(t => `<li>${t}</li>`).join('');
+-  return `<details class="tips"><summary>How to use this</summary><div class="tip-body"><ul>${li}</ul></div></details>`;
+-}
+-
+-function section(
+-  id: string,
+-  title: string,
+-  oneLiner: string,
+-  guide: string,
+-  content: string,
+-  topN?: number,
+-  total?: number,
+-  tipItems?: string[],
+-): string {
+-  const note = topN !== undefined && total !== undefined && total >= topN
+-    ? `<p class="note">Showing top ${topN} of ${total} findings.</p>`
+-    : '';
+-  return `<section id="${id}">
+-  <h2>${esc(title)}</h2>
+-  <p class="section-desc">${oneLiner}</p>
+-  ${guide}
+-  ${tips(tipItems ?? [])}
+-  <div class="section-body">${note}${content}</div>
+-</section>`;
+-}
+-
+-function summaryCard(id: string, count: number, label: string, colorClass: string, tooltip: string): string {
+-  return `<a href="#${id}" class="card ${colorClass}" title="${esc(tooltip)}">
+-  <div class="card-count">${count}</div>
+-  <div class="card-label">${esc(label)}</div>
+-</a>`;
+-}
+-
+-export function htmlReport(report: AnalysisReport, opts: AnalysisOptions = {}): string {
+-  const { topN } = opts;
++export function htmlReport(report: AnalysisReport, _opts: AnalysisOptions = {}, playData?: PlayReportData): string {
+   const { highOverlapPairs, zeroContribution, hotLines, consolidationGroups } = report.redundancy;
+-  const { fragileLines, uncoveredFunctions, lowCoverageFiles } = report.coverageDepth;
++  const { fragileLines } = report.coverageDepth;
+ 
+-  // Filter out jaccard=1.0 pairs — already shown in consolidation groups
+   const partialOverlapPairs = highOverlapPairs.filter(p => p.jaccard < 1.0);
+ 
+-  // ── Computed action counts for badge guides ──
++  // ── Build unified row list ──────────────────────────────────────────────────
++  const rows: Row[] = [];
+ 
+-  const itEachCount   = consolidationGroups.filter(g => g.suggestion === 'it.each').length;
+-  const mergeCount    = consolidationGroups.filter(g => g.suggestion === 'merge-assertions').length;
+-  const _consolidationTestTotal = consolidationGroups.reduce((n, g) => n + g.tests.length, 0);
++  for (const tc of zeroContribution) {
++    rows.push({
++      cat: 'zero', catLabel: 'Zero-contribution', catColor: 'grey',
++      subject: tc.fullName,
++      detail:  esc(tc.supersetTest),
++      rec:     'All lines covered by a larger test. Consider deleting or merging assertions.',
++    });
++  }
+ 
+-  type OverlapAction = 'delete a?' | 'delete b?' | 'investigate';
+-  function overlapAction(p: typeof partialOverlapPairs[0]): OverlapAction {
+-    if (p.aLines === p.sharedLines && p.bLines > p.sharedLines) return 'delete a?';
+-    if (p.bLines === p.sharedLines && p.aLines > p.sharedLines) return 'delete b?';
+-    return 'investigate';
++  for (const p of partialOverlapPairs) {
++    rows.push({
++      cat: 'overlap', catLabel: 'Overlap', catColor: 'indigo',
++      subject: `${p.a} / ${p.b}`,
++      detail:  `${(p.jaccard * 100).toFixed(1)}% shared (${p.sharedLines} lines)`,
++      rec:     overlapRec(p.aLines, p.bLines, p.sharedLines, p.jaccard),
++    });
++  }
++
++  for (const g of consolidationGroups) {
++    const label = g.describePath ? `${g.describePath} (${g.tests.length} tests)` : `${g.file} (${g.tests.length} tests)`;
++    rows.push({
++      cat: 'consolidate', catLabel: 'Consolidation', catColor: 'blue',
++      subject: label,
++      detail:  esc(g.file),
++      rec:     g.suggestion === 'it.each'
++        ? 'Collapse into a parameterised it.each test.'
++        : 'Merge assertions into a single test.',
++    });
++  }
++
++  for (const h of hotLines) {
++    rows.push({
++      cat: 'hot', catLabel: 'Hot line', catColor: 'red',
++      subject: `${h.source}:${h.line}`,
++      detail:  `${h.coveredBy} tests`,
++      rec:     `Covered by ${h.coveredBy} tests. Check for redundant variations.`,
++    });
+   }
+-  const deleteACount      = partialOverlapPairs.filter(p => overlapAction(p) === 'delete a?').length;
+-  const deleteBCount      = partialOverlapPairs.filter(p => overlapAction(p) === 'delete b?').length;
+-  const investigateCount  = partialOverlapPairs.filter(p => overlapAction(p) === 'investigate').length;
+ 
+-  // Group fragile lines by source file for count-by-file summary
+-  const fragileByFile = new Map<string, number>();
+   for (const f of fragileLines) {
+-    fragileByFile.set(f.source, (fragileByFile.get(f.source) ?? 0) + 1);
++    rows.push({
++      cat: 'fragile', catLabel: 'Fragile', catColor: 'amber',
++      subject: `${f.source}:${f.line}`,
++      detail:  esc(f.coveredBy),
++      rec:     'Only one test covers this line. Add a second for safety.',
++    });
+   }
+ 
+-  // ── Overlap table ──
+-  const overlapRows = partialOverlapPairs.map(p => {
+-    const action = overlapAction(p);
+-    return [
+-      esc(p.a),
+-      esc(p.b),
+-      `${(p.jaccard * 100).toFixed(1)}%`,
+-      esc(p.sharedLines),
+-      actionBadge(action),
+-    ];
+-  });
+-  const overlapTable = table(
+-    ['Test A', 'Test B', 'Jaccard', 'Shared lines', 'Action'],
+-    overlapRows,
+-  );
+-
+-  // ── Zero contribution — add delete? badge per row ──
+-  const zeroTable = table(
+-    ['Test', 'File', 'Action'],
+-    zeroContribution.map(t => [esc(t.fullName), esc(t.file), actionBadge('delete?')]),
+-  );
+-
+-  // ── Hot lines ──
+-  const hotTable = table(
+-    ['Source', 'Line', 'Tests covering'],
+-    hotLines.map(h => [esc(h.source), esc(h.line), esc(h.coveredBy)]),
+-  );
+-
+-  // ── Consolidation groups as cards ──
+-  function consolidationCards(): string {
+-    if (consolidationGroups.length === 0) return '<p class="none">No findings.</p>';
+-    return consolidationGroups.map(g => {
+-      const testList = g.tests.map(t => `<li>${esc(t)}</li>`).join('');
+-      const fileShort = g.file.split('/').slice(-2).join('/');
+-      const savings = g.tests.length - 1;
+-      return `<div class="consolidation-card">
+-  <div class="consolidation-header">
+-    ${actionBadge(g.suggestion)}
+-    <span class="consolidation-file">${esc(fileShort)}</span>
+-    ${g.describePath ? `<span class="consolidation-describe">${esc(g.describePath)}</span>` : ''}
+-    <span class="consolidation-savings">−${savings} test${savings !== 1 ? 's' : ''}</span>
+-  </div>
+-  <ul class="test-list">${testList}</ul>
+-</div>`;
+-    }).join('\n');
++  const deadControllers = playData?.controllers.filter(c => c.status !== 'routed') ?? [];
++  for (const c of deadControllers) {
++    rows.push({
++      cat: 'dead', catLabel: 'Dead controller', catColor: 'grey',
++      subject: c.relativePath,
++      detail:  deadStatusBadge(c.status),
++      rec:     deadRec(c.status),
++    });
+   }
+ 
+-  // ── Fragile lines — add "add test" badge per row ──
+-  const fragileTable = table(
+-    ['Source', 'Line', 'Sole covering test', 'Action'],
+-    fragileLines.map(f => [esc(f.source), esc(f.line), esc(f.coveredBy), actionBadge('add test')]),
+-  );
+-
+-  // ── Uncovered functions — add "add test" or "check" badge ──
+-  const uncoveredTable = table(
+-    ['Source', 'Function', 'Line', 'Action'],
+-    uncoveredFunctions.map(u => [esc(u.source), esc(u.name), esc(u.line), actionBadge('check')]),
+-  );
+-
+-  // ── Low coverage files ──
+-  const lowTable = table(
+-    ['Source', 'Line coverage', 'Action'],
+-    lowCoverageFiles.map(lf => [esc(lf.source), `${lf.lineCoverage.toFixed(1)}%`, actionBadge('add test')]),
+-  );
+-
+-  // ── Tooltip text per card (one-liners) ──
+-  const tooltips = {
+-    consolidate: 'Tests in the same describe block with identical line coverage.',
+-    overlap:     'Test pairs sharing a high proportion of covered lines.',
+-    zero:        'Tests whose every covered line is also covered by a single larger test.',
+-    hot:         'Source lines covered by an unusually high number of tests.',
+-    fragile:     'Source lines covered by exactly one test.',
+-    uncovered:   'Functions never called during the test run.',
+-    lowcoverage: 'Source files below the line coverage threshold.',
+-  };
++  // ── Categories ──────────────────────────────────────────────────────────────
++  type Cat = { cat: string; label: string; color: string; tooltip: string };
++  const categories: Cat[] = [
++    { cat: 'zero',        label: 'Zero-contribution', color: 'grey',   tooltip: 'Tests whose lines are all covered by a larger test. Safe to delete or merge.' },
++    { cat: 'overlap',     label: 'Overlap',            color: 'indigo', tooltip: 'Test pairs with many shared lines. One may be redundant if contained within the other.' },
++    { cat: 'consolidate', label: 'Consolidation',      color: 'blue',   tooltip: 'Tests with identical line coverage in the same describe block. Collapse into a parameterised test.' },
++    { cat: 'hot',         label: 'Hot lines',          color: 'red',    tooltip: 'Lines hit by many tests. May indicate redundant variations in the test suite.' },
++    { cat: 'fragile',     label: 'Fragile lines',      color: 'amber',  tooltip: 'Lines covered by a single test only. A break here would go undetected without a second.' },
++    ...(playData ? [{ cat: 'dead', label: 'Dead controllers', color: 'grey', tooltip: 'Controllers not referenced by routes, views, or application code. Candidates for removal.' }] : []),
++  ];
++
++  const countByCat: Record<string, number> = {};
++  for (const r of rows) countByCat[r.cat] = (countByCat[r.cat] ?? 0) + 1;
++
++  // ── Summary cards ───────────────────────────────────────────────────────────
++  function card(cat: string, label: string, count: number, color: string, tooltip: string): string {
++    return `<a class="card card-${color}" onclick="return ciFilter('${cat}',this)" title="${esc(tooltip)}">
++  <div class="card-count">${count}</div>
++  <div class="card-label">${esc(label)}</div>
++</a>`;
++  }
+ 
+   const summaryGrid = `<div class="summary-grid">
+-  ${summaryCard('consolidate', consolidationGroups.length, 'Consolidation candidates', 'card-blue',   tooltips.consolidate)}
+-  ${summaryCard('overlap',     partialOverlapPairs.length, 'Overlapping test pairs',   'card-indigo', tooltips.overlap)}
+-  ${summaryCard('zero',        zeroContribution.length,    'Zero-contribution tests',  'card-red',    tooltips.zero)}
+-  ${summaryCard('hot',         hotLines.length,            'Hot lines',                'card-amber',  tooltips.hot)}
+-  ${summaryCard('fragile',     fragileLines.length,        'Fragile lines',            'card-amber',  tooltips.fragile)}
+-  ${summaryCard('uncovered',   uncoveredFunctions.length,  'Uncovered functions',      'card-red',    tooltips.uncovered)}
+-  ${summaryCard('lowcoverage', lowCoverageFiles.length,    'Low coverage files',       'card-grey',   tooltips.lowcoverage)}
++  ${categories.map(c => card(c.cat, c.label, countByCat[c.cat] ?? 0, c.color, c.tooltip)).join('\n  ')}
++</div>`;
++
++  // ── Toolbar ─────────────────────────────────────────────────────────────────
++  const toolbar = `<div class="toolbar">
++  <input id="ci-search" type="search" placeholder="Filter…" oninput="ciApply()">
+ </div>`;
+ 
++  // ── Table ───────────────────────────────────────────────────────────────────
++  const tableRows = rows.length === 0
++    ? '<tr class="ci-prompt"><td colspan="4" class="none">No findings.</td></tr>'
++    : rows.map(r => `<tr data-cat="${r.cat}" class="ci-hidden">
++  <td>${badge(r.catLabel, r.catColor)}</td>
++  <td class="cell-subject">${esc(r.subject)}</td>
++  <td class="cell-detail">${r.detail}</td>
++  <td class="cell-rec">${esc(r.rec)}</td>
++</tr>`).join('\n');
++
++  const tableHtml = `<table id="ci-table">
++<thead>
++  <tr>
++    <th>Category</th>
++    <th>Subject</th>
++    <th>Larger test / Detail</th>
++    <th>Recommendation</th>
++  </tr>
++</thead>
++<tbody>
++${rows.length > 0 ? '<tr class="ci-prompt"><td colspan="4" class="none">Select a category above to filter findings.</td></tr>' : ''}
++${tableRows}
++</tbody>
++</table>`;
++
++  const intro = `<p class="intro">Generated from per-test coverage data. Each finding highlights a specific inefficiency in your test suite. Click a category card to filter the table, or use the search box to narrow by file or test name.</p>`;
++
+   const body = [
+     `<h1>coverage-insights</h1>`,
+     `<p class="generated">Generated: ${new Date().toISOString()}</p>`,
++    intro,
+     summaryGrid,
+-
+-    `<h2 class="group-heading">Redundancy</h2>`,
+-
+-    section('consolidate', 'Consolidation candidates',
+-      tooltips.consolidate,
+-      badgeGuide([
+-        { action: 'it.each',          desc: 'Collapse into a parameterised test',        count: itEachCount },
+-        { action: 'merge-assertions', desc: 'Combine assertions into one test',           count: mergeCount },
+-      ]),
+-      consolidationCards(), topN, consolidationGroups.length,
+-      [
+-        '<code>it.each</code> suits input/output variations of the same behaviour; <code>merge-assertions</code> suits multiple <code>expect</code> calls on one shared setup.',
+-        'Merging reduces test count but check readability — sometimes separate tests are clearer.',
+-        'Don\'t merge tests with different mock setups even if their line coverage matches.',
+-      ]),
+-
+-    section('overlap', 'High-overlap pairs',
+-      tooltips.overlap,
+-      badgeGuide([
+-        { action: 'delete a?',   desc: 'Test A is fully inside test B — remove A',         count: deleteACount },
+-        { action: 'delete b?',   desc: 'Test B is fully inside test A — remove B',         count: deleteBCount },
+-        { action: 'investigate', desc: 'Significant overlap — review for intentional diff', count: investigateCount },
+-      ]),
+-      overlapTable, topN, partialOverlapPairs.length,
+-      [
+-        'Jaccard similarity measures shared <em>line coverage</em>, not shared behaviour — two tests on the same lines can assert very different things.',
+-        '<strong>delete a?</strong> means test A\'s lines are fully contained in B — A adds no new coverage.',
+-        '<strong>investigate</strong> means partial overlap — verify the tests cover genuinely different code paths before removing either.',
+-      ]),
+-
+-    section('zero', 'Zero-contribution tests',
+-      tooltips.zero,
+-      badgeGuide([
+-        { action: 'delete?', desc: 'Every line this test covers is also covered by a larger test', count: zeroContribution.length },
+-      ]),
+-      zeroTable, topN, zeroContribution.length,
+-      [
+-        'Don\'t just delete. Check if the flagged test\'s <em>assertions</em> differ from the superset test.',
+-        'If assertions are unique, merge them into the covering test instead of deleting.',
+-        'Unit tests for utility functions often appear here because a higher-level test calls them indirectly — these are usually worth keeping.',
+-      ]),
+-
+-    section('hot', 'Hot lines',
+-      tooltips.hot,
+-      badgeGuide([]),
+-      hotTable, topN, hotLines.length,
+-      [
+-        'Many tests covering one line doesn\'t mean it\'s well-tested — they may all hit the same happy path.',
+-        'Check whether each covering test asserts something meaningfully different, or whether they\'re redundant variations.',
+-        'Shared setup code (constructors, imports) often appears here and is not actionable.',
+-      ]),
+-
+-    `<h2 class="group-heading">Coverage depth</h2>`,
+-
+-    section('fragile', 'Fragile lines',
+-      tooltips.fragile,
+-      badgeGuide([
+-        { action: 'add test', desc: 'Add a second test covering this line', count: fragileLines.length },
+-      ]),
+-      fragileTable, topN, fragileLines.length,
+-      [
+-        'A line covered by exactly one test will go undetected if that test is deleted or changed.',
+-        'Only actionable for critical behaviour — some code paths are only reachable one way and a single test is fine.',
+-      ]),
+-
+-    section('uncovered', 'Uncovered functions',
+-      tooltips.uncovered,
+-      badgeGuide([
+-        { action: 'check', desc: 'Add tests or confirm this function is intentionally untested', count: uncoveredFunctions.length },
+-      ]),
+-      uncoveredTable, topN, uncoveredFunctions.length,
+-      [
+-        'These functions were never called during any test run.',
+-        'Check if the function is reachable at all — if not, consider removing it.',
+-        'If reachable but untested, add a test before the next refactor.',
+-      ]),
+-
+-    section('lowcoverage', 'Low coverage files',
+-      tooltips.lowcoverage,
+-      badgeGuide([
+-        { action: 'add test', desc: 'Add tests to bring coverage above threshold', count: lowCoverageFiles.length },
+-      ]),
+-      lowTable, topN, lowCoverageFiles.length,
+-      [
+-        'Focus here first when adding new tests.',
+-        'Look at which branches are missing, not just the percentage — 60% with all critical paths covered may be healthier than 90% with untested error handling.',
+-      ]),
++    toolbar,
++    tableHtml,
+   ].join('\n');
+ 
+   return `<!DOCTYPE html>
+@@ -287,92 +194,104 @@ export function htmlReport(report: AnalysisReport, opts: AnalysisOptions = {}):
+ <title>coverage-insights report</title>
+ <style>
+   :root {
+-    --blue:   #2563eb;
+-    --indigo: #4f46e5;
+-    --red:    #dc2626;
+-    --amber:  #d97706;
+-    --grey:   #6b7280;
+-    --blue-bg:   #eff6ff;
+-    --indigo-bg: #eef2ff;
+-    --red-bg:    #fef2f2;
+-    --amber-bg:  #fffbeb;
+-    --grey-bg:   #f9fafb;
++    --blue:   #2563eb; --indigo: #4f46e5; --red:   #dc2626;
++    --amber:  #d97706; --green:  #16a34a; --grey:  #6b7280;
++    --orange: #ea580c;
++    --blue-bg:   #eff6ff; --indigo-bg: #eef2ff; --red-bg:   #fef2f2;
++    --amber-bg:  #fffbeb; --green-bg:  #f0fdf4; --grey-bg:  #f9fafb;
++    --orange-bg: #fff7ed;
+   }
+   * { box-sizing: border-box; }
+-  body { font-family: system-ui, -apple-system, sans-serif; max-width: 1200px; margin: 2rem auto; padding: 0 1.5rem; color: #111; line-height: 1.5; }
+-  h1 { font-size: 1.75rem; margin: 0 0 .25rem; }
+-  .generated { color: #888; font-size: .85rem; margin: 0 0 2rem; }
+-  h2 { font-size: 1.2rem; margin: 0 0 .4rem; color: #111; }
+-  .group-heading { font-size: 1.4rem; margin: 2.5rem 0 1rem; border-bottom: 2px solid #e5e7eb; padding-bottom: .4rem; }
+-  section { margin-bottom: 2rem; }
+-  .section-desc { color: #555; font-size: .9rem; margin: 0 0 .5rem; }
+-  .section-body { max-height: 420px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 6px; padding: .5rem; background: #fff; }
+-  .section-body .none { padding: .25rem .25rem; }
+-  .section-body table { border: none; }
+-  .section-body .consolidation-card:last-child { margin-bottom: 0; }
+-
+-  /* Badge guide */
+-  .badge-guide { display: flex; flex-wrap: wrap; gap: .5rem .75rem; align-items: center; margin: 0 0 .75rem; font-size: .85rem; }
+-  .guide-text { color: #555; }
+-  .badge-guide:empty { display: none; }
+-
+-  /* Tips */
+-  details.tips { margin: 0.4rem 0 0.75rem; }
+-  details.tips summary { font-size: 0.8rem; color: #3b82f6; cursor: pointer; list-style: none; display: flex; align-items: center; gap: 0.3rem; }
+-  details.tips summary::marker { display: none; }
+-  details.tips summary::before { content: '▶'; font-size: 0.6rem; transition: transform 0.15s; }
+-  details[open].tips summary::before { transform: rotate(90deg); }
+-  details.tips .tip-body { background: #f0f9ff; border-left: 3px solid #3b82f6; padding: 0.6rem 0.8rem; margin-top: 0.4rem; font-size: 0.8rem; color: #334155; border-radius: 0 4px 4px 0; line-height: 1.6; }
+-  details.tips .tip-body ul { margin: 0.25rem 0 0 1rem; padding: 0; }
+-  details.tips .tip-body li { margin-bottom: 0.2rem; }
++  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 1.5rem 2rem; color: #111; line-height: 1.5; background: #f8f9fa; }
++  h1 { font-size: 1.6rem; margin: 0 0 .2rem; }
++  .generated { color: #888; font-size: .85rem; margin: 0 0 .75rem; }
++  .intro { color: #555; font-size: .88rem; margin: 0 0 1.25rem; max-width: 72ch; }
+ 
+   /* Summary cards */
+-  .summary-grid { display: flex; flex-wrap: wrap; gap: .75rem; margin-bottom: 2.5rem; }
+-  .card { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1rem 1.25rem; border-radius: 8px; min-width: 120px; text-decoration: none; color: inherit; border: 1px solid transparent; transition: opacity .15s; cursor: pointer; }
++  .summary-grid { display: flex; flex-wrap: wrap; gap: .6rem; margin-bottom: 1.5rem; }
++  .card { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: .75rem 1rem; border-radius: 8px; min-width: 100px; text-decoration: none; color: inherit; border: 1px solid transparent; cursor: pointer; transition: opacity .15s; }
+   .card:hover { opacity: .8; }
+-  .card-count { font-size: 2rem; font-weight: 700; line-height: 1; }
+-  .card-label { font-size: .75rem; text-align: center; margin-top: .25rem; color: #555; }
+-  .card-blue   { background: var(--blue-bg);   border-color: #bfdbfe; }
+-  .card-indigo { background: var(--indigo-bg); border-color: #c7d2fe; }
++  .card-count { font-size: 1.75rem; font-weight: 700; line-height: 1; }
++  .card-label { font-size: .72rem; text-align: center; margin-top: .2rem; color: #555; }
+   .card-red    { background: var(--red-bg);    border-color: #fecaca; }
+   .card-amber  { background: var(--amber-bg);  border-color: #fde68a; }
++  .card-blue   { background: var(--blue-bg);   border-color: #bfdbfe; }
++  .card-indigo { background: var(--indigo-bg); border-color: #c7d2fe; }
++  .card-green  { background: var(--green-bg);  border-color: #bbf7d0; }
++  .card-orange { background: var(--orange-bg); border-color: #fed7aa; }
+   .card-grey   { background: var(--grey-bg);   border-color: #e5e7eb; }
++  .card.card-active { box-shadow: 0 0 0 3px #111; }
+ 
+   /* Badges */
+-  .badge { display: inline-block; padding: .15rem .5rem; border-radius: 4px; font-size: .78rem; font-weight: 600; white-space: nowrap; }
++  .badge { display: inline-block; padding: .15rem .45rem; border-radius: 4px; font-size: .76rem; font-weight: 600; white-space: nowrap; }
+   .badge-blue   { background: var(--blue-bg);   color: var(--blue);   border: 1px solid #bfdbfe; }
+   .badge-indigo { background: var(--indigo-bg); color: var(--indigo); border: 1px solid #c7d2fe; }
+   .badge-red    { background: var(--red-bg);    color: var(--red);    border: 1px solid #fecaca; }
+   .badge-amber  { background: var(--amber-bg);  color: var(--amber);  border: 1px solid #fde68a; }
++  .badge-green  { background: var(--green-bg);  color: var(--green);  border: 1px solid #bbf7d0; }
++  .badge-orange { background: var(--orange-bg); color: var(--orange); border: 1px solid #fed7aa; }
+   .badge-grey   { background: var(--grey-bg);   color: var(--grey);   border: 1px solid #e5e7eb; }
+ 
+-  /* Consolidation cards */
+-  .consolidation-card { border: 1px solid #e5e7eb; border-radius: 8px; padding: .75rem 1rem; margin-bottom: .75rem; background: #fff; }
+-  .consolidation-header { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-bottom: .5rem; }
+-  .consolidation-file { font-family: monospace; font-size: .85rem; color: #374151; }
+-  .consolidation-describe { font-family: monospace; font-size: .8rem; color: #6b7280; background: #f3f4f6; padding: .1rem .4rem; border-radius: 4px; }
+-  .consolidation-savings { font-size: .78rem; color: var(--red); font-weight: 600; margin-left: auto; }
+-  .test-list { margin: 0; padding-left: 1.25rem; }
+-  .test-list li { font-size: .85rem; color: #374151; padding: .1rem 0; font-family: monospace; }
+-
+-  /* Tables */
+-  table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+-  th { background: #f9fafb; text-align: left; padding: .5rem .75rem; border-bottom: 2px solid #e5e7eb; font-weight: 600; cursor: pointer; user-select: none; }
+-  th:hover { background: #f3f4f6; }
+-  td { padding: .4rem .75rem; border-bottom: 1px solid #f3f4f6; vertical-align: top; font-family: monospace; font-size: .82rem; }
+-  td:last-child { font-family: system-ui, sans-serif; }
+-  tr:hover td { background: #fafafa; }
+-  .none { color: #9ca3af; font-style: italic; }
+-  .note { color: #6b7280; font-style: italic; font-size: .85rem; }
+-  code { background: #f3f4f6; padding: .1rem .3rem; border-radius: 3px; font-size: .85em; }
++  /* Toolbar */
++  .toolbar { margin-bottom: 1rem; display: flex; flex-direction: column; gap: .5rem; }
++  #ci-search { padding: 7px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; width: 300px; font-family: inherit; outline: none; }
++  #ci-search:focus { border-color: #6b7280; }
++  .filter-btns { display: flex; gap: .4rem; flex-wrap: wrap; }
++  .fbtn { padding: 4px 12px; border-radius: 20px; border: 1px solid #d1d5db; background: white; cursor: pointer; font-size: 12px; font-family: inherit; transition: background .1s; }
++  .fbtn:hover { background: #f3f4f6; }
++  .fbtn.active { background: #111; color: white; border-color: #111; }
++
++  /* Table */
++  #ci-table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.1); font-size: 13px; }
++  #ci-table th { text-align: left; padding: 9px 12px; background: #f3f4f6; border-bottom: 2px solid #e5e7eb; font-size: 12px; white-space: nowrap; cursor: pointer; user-select: none; }
++  #ci-table th:hover { background: #e5e7eb; }
++  #ci-table td { padding: 7px 12px; border-bottom: 1px solid #f3f4f6; vertical-align: top; font-size: 12px; }
++  #ci-table tr:hover td { background: #fafafa; }
++  #ci-table tr.ci-hidden { display: none; }
++  #ci-table { table-layout: fixed; }
++  #ci-table th:nth-child(1) { width: 11%; }
++  #ci-table th:nth-child(2) { width: 30%; }
++  #ci-table th:nth-child(3) { width: 27%; }
++  #ci-table th:nth-child(4) { width: 32%; }
++  .cell-subject { font-family: monospace; word-break: break-all; }
++  .cell-detail  { font-family: monospace; color: #555; word-break: break-all; }
++  .cell-rec     { color: #374151; }
++  .none { color: #9ca3af; font-style: italic; padding: 1rem; display: block; }
+ </style>
+ <script>
++  let ciActive = null;
++
++  function ciFilter(cat, btn) {
++    if (ciActive === cat) {
++      ciActive = null;
++    } else {
++      ciActive = cat;
++      document.querySelectorAll('.summary-grid .card').forEach(c => c.classList.remove('card-active'));
++      btn.classList.add('card-active');
++    }
++    ciApply();
++    return false;
++  }
++
++  function ciApply() {
++    const q       = (document.getElementById('ci-search')?.value ?? '').toLowerCase().trim();
++    const prompt  = document.querySelector('#ci-table .ci-prompt');
++    const hasFilter = ciActive !== null || q.length > 0;
++    if (prompt) prompt.classList.toggle('ci-hidden', hasFilter);
++    document.querySelectorAll('#ci-table tbody tr[data-cat]').forEach(row => {
++      const matchCat  = ciActive === null || row.dataset.cat === ciActive;
++      const matchText = !q || (row.textContent ?? '').toLowerCase().includes(q);
++      row.classList.toggle('ci-hidden', !(hasFilter && matchCat && matchText));
++    });
++  }
++
+   document.addEventListener('DOMContentLoaded', () => {
+-    document.querySelectorAll('th').forEach((th, i) => {
++    // Sortable column headers
++    document.querySelectorAll('#ci-table th').forEach((th, i) => {
+       th.addEventListener('click', () => {
+-        const tbl = th.closest('table');
+-        const rows = Array.from(tbl.querySelectorAll('tbody tr'));
+-        const asc = th.dataset.sort !== 'asc';
++        const tbody = th.closest('table').querySelector('tbody');
++        const rows  = Array.from(tbody.querySelectorAll('tr[data-cat]'));
++        const asc   = th.dataset.sort !== 'asc';
+         rows.sort((a, b) => {
+           const at = a.cells[i]?.textContent ?? '';
+           const bt = b.cells[i]?.textContent ?? '';
+@@ -380,7 +299,7 @@ export function htmlReport(report: AnalysisReport, opts: AnalysisOptions = {}):
+           return (!isNaN(an) && !isNaN(bn) ? an - bn : at.localeCompare(bt)) * (asc ? 1 : -1);
+         });
+         th.dataset.sort = asc ? 'asc' : 'desc';
+-        rows.forEach(r => tbl.querySelector('tbody').appendChild(r));
++        rows.forEach(r => tbody.appendChild(r));
+       });
+     });
+   });
+diff --git a/src/types.ts b/src/types.ts
+index 3c034a1..253429d 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -74,10 +74,14 @@ export interface LowCoverageFile {
+   lineCoverage: number; // 0–100
+ }
+ 
++export interface ZeroContributionEntry extends TestEntry {
++  supersetTest: string; // fullName of the test that subsumes this one
++}
++
+ export interface AnalysisReport {
+   redundancy: {
+     highOverlapPairs: OverlapPair[];
+-    zeroContribution: TestEntry[];
++    zeroContribution: ZeroContributionEntry[];
+     hotLines: HotLine[];
+     consolidationGroups: ConsolidationGroup[];
+   };
+diff --git a/tests/analyse.test.ts b/tests/analyse.test.ts
+index e20b4eb..302c9d7 100644
+--- a/tests/analyse.test.ts
++++ b/tests/analyse.test.ts
+@@ -118,6 +118,16 @@ describe('zero contribution', () => {
+     expect(report.redundancy.zeroContribution).toHaveLength(0);
+   });
+ 
++  it('includes supersetTest name on the zero-contribution entry', () => {
++    const map = makeMap([
++      { file: 'tests/foo.test.ts', fullName: 'main test', sourceLines: { [SRC_A]: [1,2,3,4,5] } },
++      { file: 'tests/foo.test.ts', fullName: 'redundant test', sourceLines: { [SRC_A]: [2,3] } },
++    ]);
++    const report = analyse(map, EMPTY_SUMMARY);
++    const entry = report.redundancy.zeroContribution[0] as import('../src/types.js').ZeroContributionEntry;
++    expect(entry.supersetTest).toBe('main test');
++  });
++
+   it('requires superset to have strictly MORE lines, not equal', () => {
+     // superset check is `other.lines.size > lines.size` — equal size with same lines is NOT a superset
+     const map = makeMap([
+diff --git a/tests/build/detect.test.ts b/tests/build/detect.test.ts
+index 8782ba7..aa4734f 100644
+--- a/tests/build/detect.test.ts
++++ b/tests/build/detect.test.ts
+@@ -76,6 +76,22 @@ describe('detectRunner', () => {
+     expect(detectRunner('/project')).toBe('gradle');
+   });
+ 
++  it('returns "play" when --runner=play is passed', () => {
++    expect(detectRunner('/any', 'play')).toBe('play');
++  });
++
++  it('auto-detects play when conf/routes and app/controllers/ both exist', () => {
++    mockExistsSync.mockImplementation(p =>
++      String(p).endsWith('conf/routes') || String(p).endsWith('app/controllers'),
++    );
++    expect(detectRunner('/project')).toBe('play');
++  });
++
++  it('does not auto-detect play from conf/routes alone (no app/controllers)', () => {
++    mockExistsSync.mockImplementation(p => String(p).endsWith('conf/routes'));
++    expect(detectRunner('/project')).not.toBe('play');
++  });
++
+   it('detects gradle from build.gradle', () => {
+     mockExistsSync.mockImplementation(p => String(p).endsWith('build.gradle'));
+     expect(detectRunner('/project')).toBe('gradle');
+diff --git a/tests/build/gradle.test.ts b/tests/build/gradle.test.ts
+index 55d12f7..36ec16c 100644
+--- a/tests/build/gradle.test.ts
++++ b/tests/build/gradle.test.ts
+@@ -8,16 +8,8 @@ vi.mock('child_process', () => ({
+   execFile: vi.fn(),
+ }));
+ 
+-vi.mock('../../src/setup/gradle-listener.js', () => ({
+-  ensureListenerJar: vi.fn().mockReturnValue('/fake/listener.jar'),
+-}));
+-
+ import { execFileSync, execFile } from 'child_process';
+ import { gradleRunner, _resetSession } from '../../src/build/runners/gradle.js';
+-import { generateInitScript } from '../../src/build/runners/gradle/init-script.js';
+-import { ensureListenerJar } from '../../src/setup/gradle-listener.js';
+-
+-const mockEnsureListenerJar = vi.mocked(ensureListenerJar);
+ 
+ const mockExecFileSync = vi.mocked(execFileSync);
+ const mockExecFile = vi.mocked(execFile);
+@@ -34,6 +26,12 @@ const SUREFIRE_JUNIT = `<?xml version="1.0" encoding="UTF-8"?>
+   </testcase>
+ </testsuite>`;
+ 
++// Minimal Surefire XML for a KoTest spec
++const SUREFIRE_KOTEST = `<?xml version="1.0" encoding="UTF-8"?>
++<testsuite name="com.example.CalculatorSpec" tests="1">
++  <testcase name="Calculator - should add two numbers" classname="com.example.CalculatorSpec" time="0.2"/>
++</testsuite>`;
++
+ // Minimal JaCoCo XML
+ const JACOCO_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+ <report name="test">
+@@ -90,7 +88,7 @@ function writeKotlinTestFile(projectRoot: string, module: string, pkg: string, c
+   fs.writeFileSync(path.join(dir, `${className}.kt`), content);
+ }
+ 
+-// Write fake JaCoCo XML at the path the init script produces (used by aggregate tests only)
++// Write fake JaCoCo XML at the path the init script would produce
+ function writeJacocoXml(baseDir: string, moduleName: string, content: string) {
+   const dir = path.join(baseDir, moduleName);
+   fs.mkdirSync(dir, { recursive: true });
+@@ -446,6 +444,7 @@ describe('gradleRunner.runOne', () => {
+     fs.mkdirSync(root);
+     fs.mkdirSync(workerDir, { recursive: true });
+     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
++    // Write fake JaCoCo XML that runOne would find
+     writeJacocoXml(workerDir, 'application', JACOCO_XML);
+ 
+     const tc = {
+@@ -503,91 +502,6 @@ describe('gradleRunner.runOne', () => {
+     const testsIdx = args.indexOf('--tests');
+     expect(args[testsIdx + 1]).toContain('\\*');
+   });
+-
+-  it('passes -Pcoverage.insights.xmlDir to gradle', async () => {
+-    const root = path.join(tmpDir, 'project');
+-    const workerDir = path.join(tmpDir, 'worker-0');
+-    fs.mkdirSync(root);
+-    fs.mkdirSync(workerDir, { recursive: true });
+-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+-    writeJacocoXml(workerDir, 'application', JACOCO_XML);
+-
+-    const tc = {
+-      filePath: path.join(root, 'application'),
+-      fullName: 'com.example.FormatterTest > shouldFormatDate',
+-      title: 'shouldFormatDate',
+-      describePath: 'com.example.FormatterTest',
+-    };
+-
+-    await gradleRunner.runOne(tc, root, workerDir, undefined);
+-
+-    const args = mockExecFile.mock.calls[0][1] as string[];
+-    expect(args.some(a => a.startsWith('-Pcoverage.insights.xmlDir='))).toBe(true);
+-    expect(args.every(a => !a.startsWith('-Pcoverage.insights.jsonDir='))).toBe(true);
+-  });
+-
+-  it('writes empty coverage-final.json when no jacoco XML produced', async () => {
+-    const root = path.join(tmpDir, 'project');
+-    const workerDir = path.join(tmpDir, 'worker-0');
+-    fs.mkdirSync(root);
+-    fs.mkdirSync(workerDir, { recursive: true });
+-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+-    // No XML written — simulates test with no coverage data
+-
+-    const tc = {
+-      filePath: path.join(root, 'application'),
+-      fullName: 'com.example.FormatterTest > shouldFormatDate',
+-      title: 'shouldFormatDate',
+-      describePath: 'com.example.FormatterTest',
+-    };
+-
+-    await gradleRunner.runOne(tc, root, workerDir, undefined);
+-    const json = fs.readFileSync(path.join(workerDir, 'coverage-final.json'), 'utf8');
+-    expect(json).toBe('{}');
+-  });
+-
+-  it('uses : prefix for root-project tests to avoid running submodule test tasks', async () => {
+-    const root = path.join(tmpDir, 'project');
+-    const workerDir = path.join(tmpDir, 'worker-0');
+-    fs.mkdirSync(root);
+-    fs.mkdirSync(workerDir, { recursive: true });
+-    // No settings.gradle.kts — root project, no submodules
+-    writeJacocoXml(workerDir, '', JACOCO_XML);
+-
+-    const tc = {
+-      filePath: root,  // filePath is the root — pathToModule returns ''
+-      fullName: 'com.example.FormatterTest > shouldFormatDate',
+-      title: 'shouldFormatDate',
+-      describePath: 'com.example.FormatterTest',
+-    };
+-
+-    await gradleRunner.runOne(tc, root, workerDir, undefined);
+-    const args = mockExecFile.mock.calls[0][1] as string[];
+-    expect(args[0]).toBe(':test');  // ':test' not 'test'
+-  });
+-
+-});
+-
+-describe('generateInitScript', () => {
+-  it('includes coverage.insights.jsonDir property check in redirect block', () => {
+-    const script = generateInitScript(false);
+-    expect(script).toContain('coverage.insights.jsonDir');
+-    expect(script).toContain('ExecFileLoader');
+-    expect(script).toContain('CoverageBuilder');
+-    expect(script).toContain('coverage-final.json');
+-  });
+-
+-  it('includes coverage.insights.jsonDir property check in injection block', () => {
+-    const script = generateInitScript(true);
+-    expect(script).toContain('coverage.insights.jsonDir');
+-    expect(script).toContain('ExecFileLoader');
+-  });
+-
+-  it('still wires finalizedBy when jsonDir not set (XML mode)', () => {
+-    const script = generateInitScript(false);
+-    expect(script).toContain('finalizedBy');
+-    expect(script).toContain('jacocoTestReport');
+-  });
+ });
+ 
+ describe('gradleRunner.aggregate', () => {
+@@ -617,74 +531,3 @@ describe('gradleRunner.aggregate', () => {
+     stderrSpy.mockRestore();
+   });
+ });
+-
+-describe('gradleRunner.runAll', () => {
+-  it('calls gradlew test --no-daemon with pertest.dir property', async () => {
+-    const root = path.join(tmpDir, 'project');
+-    const workDir = path.join(tmpDir, 'batch');
+-    fs.mkdirSync(root);
+-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+-
+-    await gradleRunner.runAll!(root, workDir);
+-
+-    const testCall = mockExecFile.mock.calls.find(c => (c[1] as string[])[0] === 'test');
+-    expect(testCall).toBeDefined();
+-    const args = testCall![1] as string[];
+-    expect(args).toContain('--no-daemon');
+-    expect(args.some(a => a.startsWith('-Pcoverage.insights.pertest.dir='))).toBe(true);
+-  });
+-
+-  it('calls gradlew coverageInsightsBatchReport --no-daemon after tests', async () => {
+-    const root = path.join(tmpDir, 'project');
+-    const workDir = path.join(tmpDir, 'batch');
+-    fs.mkdirSync(root);
+-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+-
+-    await gradleRunner.runAll!(root, workDir);
+-
+-    const batchCall = mockExecFile.mock.calls.find(c => (c[1] as string[]).includes('coverageInsightsBatchReport'));
+-    expect(batchCall).toBeDefined();
+-    const args = batchCall![1] as string[];
+-    expect(args).toContain('--no-daemon');
+-    expect(args.some(a => a.startsWith('-Pcoverage.insights.pertest.dir='))).toBe(true);
+-  });
+-
+-  it('passes listenerJar path from ensureListenerJar to the test invocation', async () => {
+-    const root = path.join(tmpDir, 'project');
+-    const workDir = path.join(tmpDir, 'batch');
+-    fs.mkdirSync(root);
+-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+-    mockEnsureListenerJar.mockReturnValue('/custom/path/listener.jar');
+-
+-    await gradleRunner.runAll!(root, workDir);
+-
+-    const testCall = mockExecFile.mock.calls.find(c => (c[1] as string[])[0] === 'test');
+-    expect(testCall).toBeDefined();
+-    const args = testCall![1] as string[];
+-    expect(args).toContain('-Pcoverage.insights.listener.jar=/custom/path/listener.jar');
+-  });
+-
+-  it('does not throw if the test run fails', async () => {
+-    const root = path.join(tmpDir, 'project');
+-    const workDir = path.join(tmpDir, 'batch');
+-    fs.mkdirSync(root);
+-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+-
+-    // Make the test run call invoke callback with an error (simulating test failures),
+-    // batchReport should still run
+-    mockExecFile.mockImplementation((_cmd, args: unknown, _opts, cb) => {
+-      const a = args as string[];
+-      if (a[0] === 'test') {
+-        setImmediate(() => (cb as (e: null) => void)(null));  // swallowed — test failures OK
+-      } else {
+-        setImmediate(() => (cb as (e: null) => void)(null));
+-      }
+-      return undefined as unknown as ReturnType<typeof execFile>;
+-    });
+-
+-    await expect(gradleRunner.runAll!(root, workDir)).resolves.toBeUndefined();
+-
+-    const batchCall = mockExecFile.mock.calls.find(c => (c[1] as string[]).includes('coverageInsightsBatchReport'));
+-    expect(batchCall).toBeDefined();
+-  });
+-});
+diff --git a/tests/build/index.test.ts b/tests/build/index.test.ts
+deleted file mode 100644
+index 9404366..0000000
+--- a/tests/build/index.test.ts
++++ /dev/null
+@@ -1,86 +0,0 @@
+-import { describe, it, expect } from 'vitest';
+-import { batchOutputToMap } from '../../src/build/index.js';
+-import type { TestCase } from '../../src/build/index.js';
+-
+-const TC1: TestCase = {
+-  filePath: '/project/application',
+-  fullName: 'com.example.MathTest > addsTwoNumbers',
+-  title: 'addsTwoNumbers',
+-  describePath: 'com.example.MathTest',
+-};
+-
+-const TC2: TestCase = {
+-  filePath: '/project/application',
+-  fullName: 'com.example.MathTest > subtractsNumbers',
+-  title: 'subtractsNumbers',
+-  describePath: 'com.example.MathTest',
+-};
+-
+-describe('batchOutputToMap', () => {
+-  it('maps test name to correct TestCase using safeFileName matching', () => {
+-    const batchRaw = {
+-      'com.example.MathTest.addsTwoNumbers': {
+-        '/project/src/main/java/com/example/Math.java': [10, 11, 12],
+-      },
+-    };
+-
+-    const result = batchOutputToMap(batchRaw, [TC1, TC2], '/project');
+-    const key = 'application > com.example.MathTest > addsTwoNumbers';
+-    expect(result[key]).toBeDefined();
+-    expect(result[key].title).toBe('addsTwoNumbers');
+-    expect(result[key].fullName).toBe('com.example.MathTest > addsTwoNumbers');
+-  });
+-
+-  it('skips entries with no matching TestCase', () => {
+-    const batchRaw = {
+-      'com.example.UnknownTest.someMethod': {
+-        '/project/src/main/java/com/example/Math.java': [1, 2, 3],
+-      },
+-    };
+-
+-    const result = batchOutputToMap(batchRaw, [TC1], '/project');
+-    expect(Object.keys(result)).toHaveLength(0);
+-  });
+-
+-  it('skips files with empty line arrays', () => {
+-    const batchRaw = {
+-      'com.example.MathTest.addsTwoNumbers': {
+-        '/project/src/main/java/com/example/Math.java': [],
+-        '/project/src/main/java/com/example/Other.java': [5, 6],
+-      },
+-    };
+-
+-    const result = batchOutputToMap(batchRaw, [TC1], '/project');
+-    const key = 'application > com.example.MathTest > addsTwoNumbers';
+-    expect(result[key]).toBeDefined();
+-    const sourceKeys = Object.keys(result[key].sourceLines);
+-    expect(sourceKeys).not.toContain('src/main/java/com/example/Math.java');
+-    expect(sourceKeys).toContain('src/main/java/com/example/Other.java');
+-  });
+-
+-  it('skips entire entry when all file line arrays are empty', () => {
+-    const batchRaw = {
+-      'com.example.MathTest.addsTwoNumbers': {
+-        '/project/src/main/java/com/example/Math.java': [],
+-      },
+-    };
+-
+-    const result = batchOutputToMap(batchRaw, [TC1], '/project');
+-    expect(Object.keys(result)).toHaveLength(0);
+-  });
+-
+-  it('correctly applies shortPath to absolute file paths', () => {
+-    const batchRaw = {
+-      'com.example.MathTest.addsTwoNumbers': {
+-        '/project/src/main/java/com/example/Math.java': [10, 11],
+-      },
+-    };
+-
+-    const result = batchOutputToMap(batchRaw, [TC1], '/project');
+-    const key = 'application > com.example.MathTest > addsTwoNumbers';
+-    expect(result[key]).toBeDefined();
+-    const sourceKeys = Object.keys(result[key].sourceLines);
+-    // shortPath strips /project/ prefix
+-    expect(sourceKeys[0]).toBe('src/main/java/com/example/Math.java');
+-  });
+-});
+diff --git a/tests/build/play.dead-controllers.test.ts b/tests/build/play.dead-controllers.test.ts
+new file mode 100644
+index 0000000..efa3523
+--- /dev/null
++++ b/tests/build/play.dead-controllers.test.ts
+@@ -0,0 +1,47 @@
++import { describe, it, expect } from 'vitest';
++import path from 'path';
++import { analyseControllers } from '../../src/build/runners/play/dead-controllers.js';
++
++const FIXTURE = path.resolve(__dirname, '../fixtures/play-project');
++
++describe('analyseControllers', () => {
++  it('returns results for all non-abstract controllers', () => {
++    const results = analyseControllers(FIXTURE);
++    expect(results.length).toBeGreaterThan(0);
++  });
++
++  it('classifies HomeController as routed', () => {
++    const results = analyseControllers(FIXTURE);
++    const home = results.find(r => r.simpleName === 'HomeController');
++    expect(home).toBeDefined();
++    expect(home!.status).toBe('routed');
++  });
++
++  it('classifies AdminController as routed', () => {
++    const results = analyseControllers(FIXTURE);
++    const admin = results.find(r => r.simpleName === 'AdminController');
++    expect(admin).toBeDefined();
++    expect(admin!.status).toBe('routed');
++  });
++
++  it('classifies DeadController as unreferenced', () => {
++    const results = analyseControllers(FIXTURE);
++    const dead = results.find(r => r.simpleName === 'DeadController');
++    expect(dead).toBeDefined();
++    expect(dead!.status).toBe('unreferenced');
++  });
++
++  it('each result has a relative path under app/controllers/', () => {
++    const results = analyseControllers(FIXTURE);
++    expect(results.every(r => r.relativePath.startsWith('app/controllers/'))).toBe(true);
++  });
++
++  it('returns summary counts by status', () => {
++    const { summary } = analyseControllers(FIXTURE) as unknown as { summary: Record<string, number> };
++    // The array is the result — we test summary separately
++    const results = analyseControllers(FIXTURE);
++    const statuses = results.map(r => r.status);
++    expect(statuses).toContain('routed');
++    expect(statuses).toContain('unreferenced');
++  });
++});
+diff --git a/tests/build/play.itest.test.ts b/tests/build/play.itest.test.ts
+new file mode 100644
+index 0000000..f410b63
+--- /dev/null
++++ b/tests/build/play.itest.test.ts
+@@ -0,0 +1,49 @@
++import { describe, it, expect } from 'vitest';
++import path from 'path';
++import { discoverITestCases } from '../../src/build/runners/play/itest-analysis.js';
++
++const FIXTURE = path.resolve(__dirname, '../fixtures/play-project');
++
++describe('discoverITestCases', () => {
++  it('finds ITest files in test/', () => {
++    const cases = discoverITestCases(FIXTURE);
++    expect(cases.length).toBeGreaterThan(0);
++  });
++
++  it('does not include UTest files', () => {
++    const cases = discoverITestCases(FIXTURE);
++    expect(cases.every(tc => tc.file.endsWith('ITest.java'))).toBe(true);
++  });
++
++  it('produces one TestCase per @Test-like method', () => {
++    const cases = discoverITestCases(FIXTURE);
++    // HomeControllerITest has testIndex + testSubmit; AdminControllerITest has testList + testCreate
++    expect(cases.length).toBe(4);
++  });
++
++  it('sets describePath to the ITest class name', () => {
++    const cases = discoverITestCases(FIXTURE);
++    const home = cases.filter(tc => tc.describePath === 'test.controllers.HomeControllerITest');
++    expect(home.length).toBe(2);
++  });
++
++  it('maps EndpointTest url() patterns to controller source files', () => {
++    const cases = discoverITestCases(FIXTURE);
++    const testIndex = cases.find(tc => tc.title === 'testIndex' && tc.describePath.includes('HomeController'));
++    expect(testIndex).toBeDefined();
++    // url("home") should resolve to app/controllers/HomeController.java
++    expect(testIndex!.staticTargets?.some(t => t.includes('HomeController.java'))).toBe(true);
++  });
++
++  it('maps AdminControllerITest url("admin") to AdminController', () => {
++    const cases = discoverITestCases(FIXTURE);
++    const testList = cases.find(tc => tc.title === 'testList');
++    expect(testList).toBeDefined();
++    expect(testList!.staticTargets?.some(t => t.includes('AdminController.java'))).toBe(true);
++  });
++
++  it('applies fileFilter when provided', () => {
++    const cases = discoverITestCases(FIXTURE, 'HomeController');
++    expect(cases.every(tc => tc.file.includes('HomeController'))).toBe(true);
++  });
++});
+diff --git a/tests/build/play.routes.test.ts b/tests/build/play.routes.test.ts
+new file mode 100644
+index 0000000..d8d0bce
+--- /dev/null
++++ b/tests/build/play.routes.test.ts
+@@ -0,0 +1,65 @@
++import { describe, it, expect } from 'vitest';
++import path from 'path';
++import { parseRoutes, matchRoute } from '../../src/build/runners/play/routes.js';
++
++const FIXTURE = path.resolve(__dirname, '../fixtures/play-project/conf/routes');
++
++describe('parseRoutes', () => {
++  it('returns an array of route entries', () => {
++    const routes = parseRoutes(FIXTURE);
++    expect(Array.isArray(routes)).toBe(true);
++    expect(routes.length).toBeGreaterThan(0);
++  });
++
++  it('skips comment lines, blank lines, and static file routes', () => {
++    const routes = parseRoutes(FIXTURE);
++    expect(routes.every(r => r.method && r.urlPattern && r.controllerFqn)).toBe(true);
++    expect(routes.every(r => !r.controllerFqn.startsWith('staticDir'))).toBe(true);
++  });
++
++  it('parses GET /home → controllers.HomeController.index', () => {
++    const routes = parseRoutes(FIXTURE);
++    const home = routes.find(r => r.urlPattern === '/home' && r.method === 'GET');
++    expect(home).toBeDefined();
++    expect(home!.controllerFqn).toBe('controllers.HomeController');
++    expect(home!.action).toBe('index');
++  });
++
++  it('parses POST /admin → controllers.AdminController.create', () => {
++    const routes = parseRoutes(FIXTURE);
++    const route = routes.find(r => r.urlPattern === '/admin' && r.method === 'POST');
++    expect(route).toBeDefined();
++    expect(route!.controllerFqn).toBe('controllers.AdminController');
++    expect(route!.action).toBe('create');
++  });
++
++  it('parses parameterised routes like /admin/{id}', () => {
++    const routes = parseRoutes(FIXTURE);
++    const route = routes.find(r => r.urlPattern.startsWith('/admin/'));
++    expect(route).toBeDefined();
++    expect(route!.controllerFqn).toBe('controllers.AdminController');
++    expect(route!.action).toBe('view');
++  });
++});
++
++describe('matchRoute', () => {
++  it('matches url segments ["home"] to HomeController', () => {
++    const routes = parseRoutes(FIXTURE);
++    const match = matchRoute(['home'], routes);
++    expect(match).toBeDefined();
++    expect(match!.controllerFqn).toBe('controllers.HomeController');
++  });
++
++  it('matches url segments ["admin"] to AdminController', () => {
++    const routes = parseRoutes(FIXTURE);
++    const match = matchRoute(['admin'], routes);
++    expect(match).toBeDefined();
++    expect(match!.controllerFqn).toBe('controllers.AdminController');
++  });
++
++  it('returns null for unmatched urls', () => {
++    const routes = parseRoutes(FIXTURE);
++    const match = matchRoute(['nonexistent', 'path'], routes);
++    expect(match).toBeNull();
++  });
++});
+diff --git a/tests/build/play.test.ts b/tests/build/play.test.ts
+new file mode 100644
+index 0000000..74bf2fb
+--- /dev/null
++++ b/tests/build/play.test.ts
+@@ -0,0 +1,94 @@
++import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
++import path from 'path';
++import os from 'os';
++import fs from 'fs';
++
++vi.mock('child_process', () => ({
++  execFileSync: vi.fn().mockReturnValue(''),
++  execFile: vi.fn().mockImplementation((_p: unknown, _a: unknown, _o: unknown, cb: (err: null) => void) => { cb(null); return {}; }),
++}));
++
++import { playRunner } from '../../src/build/runners/play.js';
++import { _resetSession } from '../../src/build/runners/gradle.js';
++
++const FIXTURE = path.resolve(__dirname, '../fixtures/play-project');
++
++let tmpDir: string;
++
++beforeEach(() => {
++  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'play-runner-'));
++  vi.clearAllMocks();
++  _resetSession();
++});
++
++afterEach(() => {
++  fs.rmSync(tmpDir, { recursive: true, force: true });
++});
++
++describe('playRunner.discover', () => {
++  it('returns UTest cases from the test/ directory', async () => {
++    const cases = await playRunner.discover(FIXTURE, undefined, undefined);
++    const uTests = cases.filter(tc => !tc.filePath.endsWith('ITest.java'));
++    expect(uTests.length).toBeGreaterThan(0);
++  });
++
++  it('returns ITest cases alongside UTest cases', async () => {
++    const cases = await playRunner.discover(FIXTURE, undefined, undefined);
++    const iTests = cases.filter(tc => tc.filePath.endsWith('ITest.java'));
++    expect(iTests.length).toBeGreaterThan(0);
++  });
++
++  it('ITest cases carry staticTargets linking to controller source files', async () => {
++    const cases = await playRunner.discover(FIXTURE, undefined, undefined);
++    const iTests = cases.filter(tc => tc.filePath.endsWith('ITest.java'));
++    const withTargets = iTests.filter(tc => (tc as import('../../src/build/runners/play/itest-analysis.js').PlayITestCase).staticTargets?.length > 0);
++    expect(withTargets.length).toBeGreaterThan(0);
++  });
++
++  it('applies fileFilter to both UTest and ITest discovery', async () => {
++    const cases = await playRunner.discover(FIXTURE, 'HomeController', undefined);
++    expect(cases.every(tc => tc.filePath.includes('HomeController') || tc.file?.includes('HomeController'))).toBe(true);
++  });
++});
++
++describe('playRunner.runOne — ITest', () => {
++  it('writes a coverage-final.json for an ITest without running Gradle', async () => {
++    const cases = await playRunner.discover(FIXTURE, undefined, undefined);
++    const iTest = cases.find(tc => tc.filePath.endsWith('ITest.java'));
++    if (!iTest) throw new Error('No ITest case found');
++
++    const workerDir = path.join(tmpDir, 'worker-0');
++    fs.mkdirSync(workerDir, { recursive: true });
++    await playRunner.runOne(iTest, FIXTURE, workerDir, undefined);
++
++    const coveragePath = path.join(workerDir, 'coverage-final.json');
++    expect(fs.existsSync(coveragePath)).toBe(true);
++  });
++
++  it('ITest coverage-final.json maps controller source files to line arrays', async () => {
++    const cases = await playRunner.discover(FIXTURE, undefined, undefined);
++    const iTest = cases.find(tc =>
++      tc.filePath.endsWith('ITest.java') &&
++      (tc as import('../../src/build/runners/play/itest-analysis.js').PlayITestCase).staticTargets?.length > 0,
++    );
++    if (!iTest) throw new Error('No ITest case with static targets found');
++
++    const workerDir = path.join(tmpDir, 'worker-0');
++    fs.mkdirSync(workerDir, { recursive: true });
++    await playRunner.runOne(iTest, FIXTURE, workerDir, undefined);
++
++    const raw = JSON.parse(fs.readFileSync(path.join(workerDir, 'coverage-final.json'), 'utf8'));
++    // At least one key pointing to a controller file
++    const keys = Object.keys(raw);
++    expect(keys.some(k => k.includes('Controller'))).toBe(true);
++  });
++});
++
++describe('playRunner — gradle runner unchanged', () => {
++  it('gradleRunner.discover still works independently (no play contamination)', async () => {
++    const { gradleRunner } = await import('../../src/build/runners/gradle.js');
++    const cases = await gradleRunner.discover(FIXTURE, undefined, undefined);
++    // gradleRunner only sees UTest files — no ITests
++    expect(cases.every(tc => !tc.filePath.endsWith('ITest.java'))).toBe(true);
++  });
++});
+diff --git a/tests/cli.fixture.test.ts b/tests/cli.fixture.test.ts
+new file mode 100644
+index 0000000..255fec2
+--- /dev/null
++++ b/tests/cli.fixture.test.ts
+@@ -0,0 +1,139 @@
++/**
++ * Integration test for the --no-build pipeline with a pre-built fixture.
++ * Verifies: fixture loading, HTML report generation, --open behaviour,
++ * and that the recent improvements are present in the generated report.
++ */
++import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
++import path from 'path';
++import os from 'os';
++import fs from 'fs';
++
++// vi.mock is hoisted, so spawnMock must be declared with vi.hoisted()
++const { spawnMock } = vi.hoisted(() => ({
++  spawnMock: vi.fn().mockReturnValue({ unref: vi.fn() }),
++}));
++
++vi.mock('child_process', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('child_process')>();
++  return {
++    ...actual,
++    execFileSync: vi.fn().mockReturnValue(''),
++    execFile: vi.fn().mockImplementation((_p: unknown, _a: unknown, _o: unknown, cb: (err: null) => void) => { cb(null); return {} as ReturnType<typeof actual.execFile>; }),
++    spawn: spawnMock,
++  };
++});
++
++import { main } from '../src/cli.js';
++
++const FIXTURE_MAP = path.resolve(__dirname, 'fixtures/gradle-report/test-line-map.json');
++const PLAY_ROOT   = path.resolve(__dirname, 'fixtures/play-project');
++
++let outDir: string;
++let originalArgv: string[];
++
++beforeEach(() => {
++  outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-fixture-'));
++  originalArgv = process.argv;
++  spawnMock.mockClear();
++  vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
++  vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
++});
++
++afterEach(() => {
++  process.argv = originalArgv;
++  fs.rmSync(outDir, { recursive: true, force: true });
++  vi.restoreAllMocks();
++});
++
++function runWithFixture(extraArgs: string[] = []): Promise<void> {
++  fs.mkdirSync(outDir, { recursive: true });
++  fs.copyFileSync(FIXTURE_MAP, path.join(outDir, 'test-line-map.json'));
++  process.argv = ['node', 'cli.js', '--no-build', `--out=${outDir}`, '--no-aggregate', ...extraArgs];
++  return main();
++}
++
++describe('CLI --no-build --runner=play with play fixture', () => {
++  it('report.html includes Dead Controllers section when runner=play', async () => {
++    fs.mkdirSync(outDir, { recursive: true });
++    fs.writeFileSync(path.join(outDir, 'test-line-map.json'), '{}', 'utf8');
++    process.argv = ['node', 'cli.js', '--no-build', `--root=${PLAY_ROOT}`, `--out=${outDir}`, '--runner=play'];
++    await main();
++    const html = fs.readFileSync(path.join(outDir, 'report.html'), 'utf8');
++    expect(html).toContain('Dead controllers');
++  });
++});
++
++describe('CLI --no-build with gradle fixture', () => {
++  it('generates report.html from the fixture without running Gradle', async () => {
++    await runWithFixture();
++    expect(fs.existsSync(path.join(outDir, 'report.html'))).toBe(true);
++  });
++
++  it('report.html is valid HTML starting with <!DOCTYPE html>', async () => {
++    await runWithFixture();
++    const html = fs.readFileSync(path.join(outDir, 'report.html'), 'utf8');
++    expect(html.trimStart()).toMatch(/^<!DOCTYPE html>/i);
++  });
++
++  it('opens the browser by default', async () => {
++    await runWithFixture();
++    const htmlPath = path.join(outDir, 'report.html');
++    expect(spawnMock).toHaveBeenCalledWith('open', [htmlPath], expect.objectContaining({ detached: true }));
++  });
++
++  it('--no-open suppresses browser launch', async () => {
++    await runWithFixture(['--no-open']);
++    expect(spawnMock).not.toHaveBeenCalled();
++  });
++
++  // ── Recent improvements ──────────────────────────────────────────────────────
++
++  it('report contains toolbar with search input', async () => {
++    await runWithFixture();
++    const html = fs.readFileSync(path.join(outDir, 'report.html'), 'utf8');
++    expect(html).toContain('type="search"');
++  });
++
++  it('report contains category filter buttons', async () => {
++    await runWithFixture();
++    const html = fs.readFileSync(path.join(outDir, 'report.html'), 'utf8');
++    expect(html).toContain('Zero-contribution');
++    expect(html).toContain('Hot lines');
++    expect(html).toContain('Fragile lines');
++  });
++
++  it('report contains a single unified table', async () => {
++    await runWithFixture();
++    const html = fs.readFileSync(path.join(outDir, 'report.html'), 'utf8');
++    expect(html).toContain('id="ci-table"');
++  });
++
++  it('report uses data-cat attributes for row filtering', async () => {
++    await runWithFixture();
++    const html = fs.readFileSync(path.join(outDir, 'report.html'), 'utf8');
++    expect(html).toMatch(/data-cat="/);
++  });
++
++  it('report detects consolidation candidates (identical line coverage in same describe)', async () => {
++    await runWithFixture();
++    const html = fs.readFileSync(path.join(outDir, 'report.html'), 'utf8');
++    // testAdd and testAddAlias cover identical lines in same describe → consolidation candidate
++    expect(html).toContain('data-cat="consolidate"');
++    expect(html).toContain('badge-blue');
++  });
++
++  it('report detects fragile lines (BazHelper lines covered by only one test)', async () => {
++    await runWithFixture();
++    const html = fs.readFileSync(path.join(outDir, 'report.html'), 'utf8');
++    expect(html).toContain('data-cat="fragile"');
++    expect(html).toContain('badge-amber');
++    expect(html).toContain('Add a second for safety');
++  });
++
++  it('report is self-contained (no external scripts or stylesheets)', async () => {
++    await runWithFixture();
++    const html = fs.readFileSync(path.join(outDir, 'report.html'), 'utf8');
++    expect(html).not.toMatch(/<script\s+src=/i);
++    expect(html).not.toMatch(/<link\s+rel="stylesheet"/i);
++  });
++});
+diff --git a/tests/fixtures/gradle-report/test-line-map.json b/tests/fixtures/gradle-report/test-line-map.json
+new file mode 100644
+index 0000000..1c2d695
+--- /dev/null
++++ b/tests/fixtures/gradle-report/test-line-map.json
+@@ -0,0 +1,37 @@
++{
++  "test/helpers/FooHelperTest.java > com.example.FooHelperTest > testAdd": {
++    "file": "test/helpers/FooHelperTest.java",
++    "fullName": "com.example.FooHelperTest > testAdd",
++    "title": "testAdd",
++    "describePath": "com.example.FooHelperTest",
++    "sourceLines": { "app/helpers/FooHelper.java": [10, 11, 12, 13, 14] }
++  },
++  "test/helpers/FooHelperTest.java > com.example.FooHelperTest > testAddAlias": {
++    "file": "test/helpers/FooHelperTest.java",
++    "fullName": "com.example.FooHelperTest > testAddAlias",
++    "title": "testAddAlias",
++    "describePath": "com.example.FooHelperTest",
++    "sourceLines": { "app/helpers/FooHelper.java": [10, 11, 12, 13, 14] }
++  },
++  "test/helpers/BarHelperTest.java > com.example.BarHelperTest > testProcess": {
++    "file": "test/helpers/BarHelperTest.java",
++    "fullName": "com.example.BarHelperTest > testProcess",
++    "title": "testProcess",
++    "describePath": "com.example.BarHelperTest",
++    "sourceLines": { "app/helpers/BarHelper.java": [5, 6, 7] }
++  },
++  "test/helpers/BarHelperTest.java > com.example.BarHelperTest > testEdgeCase": {
++    "file": "test/helpers/BarHelperTest.java",
++    "fullName": "com.example.BarHelperTest > testEdgeCase",
++    "title": "testEdgeCase",
++    "describePath": "com.example.BarHelperTest",
++    "sourceLines": { "app/helpers/BarHelper.java": [5, 6, 7] }
++  },
++  "test/helpers/BazHelperTest.java > com.example.BazHelperTest > testFragile": {
++    "file": "test/helpers/BazHelperTest.java",
++    "fullName": "com.example.BazHelperTest > testFragile",
++    "title": "testFragile",
++    "describePath": "com.example.BazHelperTest",
++    "sourceLines": { "app/helpers/BazHelper.java": [20, 21] }
++  }
++}
+diff --git a/tests/fixtures/play-project/app/controllers/AdminController.java b/tests/fixtures/play-project/app/controllers/AdminController.java
+new file mode 100644
+index 0000000..35156f9
+--- /dev/null
++++ b/tests/fixtures/play-project/app/controllers/AdminController.java
+@@ -0,0 +1,15 @@
++package controllers;
++
++import play.mvc.Controller;
++
++public class AdminController extends Controller {
++    public static void list() {
++        render();
++    }
++    public static void create() {
++        redirect("/admin");
++    }
++    public static void view(String id) {
++        render();
++    }
++}
+diff --git a/tests/fixtures/play-project/app/controllers/DeadController.java b/tests/fixtures/play-project/app/controllers/DeadController.java
+new file mode 100644
+index 0000000..975b90a
+--- /dev/null
++++ b/tests/fixtures/play-project/app/controllers/DeadController.java
+@@ -0,0 +1,9 @@
++package controllers;
++
++import play.mvc.Controller;
++
++public class DeadController extends Controller {
++    public static void index() {
++        render();
++    }
++}
+diff --git a/tests/fixtures/play-project/app/controllers/HomeController.java b/tests/fixtures/play-project/app/controllers/HomeController.java
+new file mode 100644
+index 0000000..064b84e
+--- /dev/null
++++ b/tests/fixtures/play-project/app/controllers/HomeController.java
+@@ -0,0 +1,12 @@
++package controllers;
++
++import play.mvc.Controller;
++
++public class HomeController extends Controller {
++    public static void index() {
++        render();
++    }
++    public static void submit() {
++        redirect("/home");
++    }
++}
+diff --git a/tests/fixtures/play-project/app/helpers/StringHelper.java b/tests/fixtures/play-project/app/helpers/StringHelper.java
+new file mode 100644
+index 0000000..45cfdb0
+--- /dev/null
++++ b/tests/fixtures/play-project/app/helpers/StringHelper.java
+@@ -0,0 +1,10 @@
++package helpers;
++
++public class StringHelper {
++    public static String trim(String s) {
++        return s == null ? "" : s.trim();
++    }
++    public static String toUpperCase(String s) {
++        return s == null ? "" : s.toUpperCase();
++    }
++}
+diff --git a/tests/fixtures/play-project/conf/routes b/tests/fixtures/play-project/conf/routes
+new file mode 100644
+index 0000000..402dbf3
+--- /dev/null
++++ b/tests/fixtures/play-project/conf/routes
+@@ -0,0 +1,9 @@
++# Routes for play-project fixture
++
++GET     /                           controllers.Application.index()
++GET     /home                       controllers.HomeController.index()
++POST    /home                       controllers.HomeController.submit()
++GET     /admin                      controllers.AdminController.list()
++POST    /admin                      controllers.AdminController.create()
++GET     /admin/{id}                 controllers.AdminController.view(id)
++GET     /favicon.ico                staticDir:public
+diff --git a/tests/fixtures/play-project/test/controllers/AdminControllerITest.java b/tests/fixtures/play-project/test/controllers/AdminControllerITest.java
+new file mode 100644
+index 0000000..a32e16a
+--- /dev/null
++++ b/tests/fixtures/play-project/test/controllers/AdminControllerITest.java
+@@ -0,0 +1,15 @@
++package test.controllers;
++
++import play.test.EndpointTest;
++import controllers.AdminController;
++
++public class AdminControllerITest extends EndpointTest {
++    public void testList() {
++        url("admin");
++        assertIsOk();
++    }
++    public void testCreate() {
++        url("admin");
++        assertIsOk();
++    }
++}
+diff --git a/tests/fixtures/play-project/test/controllers/HomeControllerITest.java b/tests/fixtures/play-project/test/controllers/HomeControllerITest.java
+new file mode 100644
+index 0000000..7b8663c
+--- /dev/null
++++ b/tests/fixtures/play-project/test/controllers/HomeControllerITest.java
+@@ -0,0 +1,14 @@
++package test.controllers;
++
++import play.test.EndpointTest;
++
++public class HomeControllerITest extends EndpointTest {
++    public void testIndex() {
++        url("home");
++        assertIsOk();
++    }
++    public void testSubmit() {
++        url("home");
++        assertIsOk();
++    }
++}
+diff --git a/tests/fixtures/play-project/test/helpers/StringHelperUTest.java b/tests/fixtures/play-project/test/helpers/StringHelperUTest.java
+new file mode 100644
+index 0000000..54c96d7
+--- /dev/null
++++ b/tests/fixtures/play-project/test/helpers/StringHelperUTest.java
+@@ -0,0 +1,15 @@
++package test.helpers;
++
++import org.junit.Test;
++import helpers.StringHelper;
++
++public class StringHelperUTest {
++    @Test
++    public void testTrim() {
++        // test trim
++    }
++    @Test
++    public void testUpperCase() {
++        // test upper
++    }
++}
+diff --git a/tests/report/html.test.ts b/tests/report/html.test.ts
+index cbc4e08..083832b 100644
+--- a/tests/report/html.test.ts
++++ b/tests/report/html.test.ts
+@@ -2,6 +2,10 @@ import { describe, it, expect } from 'vitest';
+ import { htmlReport } from '../../src/report/html.js';
+ import type { AnalysisReport } from '../../src/types.js';
+ 
++function makeZero(fullName: string, supersetTest = 'superset test'): import('../../src/types.js').ZeroContributionEntry {
++  return { file: 'a.ts', fullName, title: fullName, describePath: '', sourceLines: {}, supersetTest };
++}
++
+ function makeReport(overrides: Partial<AnalysisReport> = {}): AnalysisReport {
+   return {
+     redundancy: { highOverlapPairs: [], zeroContribution: [], hotLines: [], consolidationGroups: [] },
+@@ -10,6 +14,7 @@ function makeReport(overrides: Partial<AnalysisReport> = {}): AnalysisReport {
+   };
+ }
+ 
++// ─── Structure ───────────────────────────────────────────────────────────────
+ describe('htmlReport — structure', () => {
+   it('returns a string starting with <!DOCTYPE html>', () => {
+     const html = htmlReport(makeReport());
+@@ -21,418 +26,438 @@ describe('htmlReport — structure', () => {
+     expect(html).not.toMatch(/<script\s+src=/i);
+     expect(html).not.toMatch(/<link\s+rel="stylesheet"/i);
+   });
++
++  it('contains a single unified table with id="ci-table"', () => {
++    const html = htmlReport(makeReport());
++    expect(html).toContain('id="ci-table"');
++  });
++
++  it('shows "No findings." when all sections are empty', () => {
++    const html = htmlReport(makeReport());
++    expect(html).toContain('No findings.');
++  });
+ });
+ 
+-// ─── actionBadge colour mapping ──────────────────────────────────────────────
+-describe('htmlReport — badge colours', () => {
+-  it('it.each suggestion produces a blue badge', () => {
++// ─── Filter buttons ───────────────────────────────────────────────────────────
++describe('htmlReport — filter buttons', () => {
++  it('contains category labels in the summary cards', () => {
++    const html = htmlReport(makeReport());
++    expect(html).toContain('Zero-contribution');
++    expect(html).toContain('Hot lines');
++    expect(html).toContain('Fragile lines');
++    expect(html).toContain('Overlap');
++    expect(html).toContain('Consolidation');
++  });
++
++  it('does NOT contain a separate row of pill filter buttons', () => {
++    const html = htmlReport(makeReport());
++    expect(html).not.toContain('class="filter-btns"');
++    expect(html).not.toContain('class="fbtn"');
++  });
++
++  it('shows "Select a category" prompt when findings exist but no filter active', () => {
+     const report = makeReport({
+-      redundancy: {
+-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
+-        consolidationGroups: [{
+-          file: 'tests/foo.test.ts', describePath: 'x',
+-          tests: ['x > test A', 'x > test B'],
+-          suggestion: 'it.each',
+-        }],
+-      },
++      coverageDepth: { fragileLines: [{ source: 'src/a.ts', line: 1, coveredBy: 'x' }], uncoveredFunctions: [], lowCoverageFiles: [] },
+     });
+     const html = htmlReport(report);
+-    expect(html).toContain('badge-blue');
+-    expect(html).toContain('it.each');
++    expect(html).toContain('Select a category');
+   });
+ 
+-  it('merge-assertions suggestion produces an indigo badge', () => {
++  it('does NOT have an "All findings" card', () => {
++    const html = htmlReport(makeReport());
++    expect(html).not.toContain('All findings');
++  });
++
++  it('contains Dead controllers button when playData is provided', () => {
++    const html = htmlReport(makeReport(), {}, { controllers: [] });
++    expect(html).toContain('Dead controllers');
++  });
++
++  it('does NOT contain Dead controllers button when no playData', () => {
++    const html = htmlReport(makeReport());
++    expect(html).not.toContain('Dead controllers');
++  });
++
++  it('contains a search input', () => {
++    const html = htmlReport(makeReport());
++    expect(html).toContain('id="ci-search"');
++    expect(html).toContain('type="search"');
++  });
++});
++
++// ─── Summary cards ────────────────────────────────────────────────────────────
++describe('htmlReport — summary cards', () => {
++  it('shows correct count for zero-contribution tests', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
+-        consolidationGroups: [{
+-          file: 'tests/foo.test.ts', describePath: 'x',
+-          tests: ['x > test A', 'x > test B'],
+-          suggestion: 'merge-assertions',
+-        }],
++        highOverlapPairs: [],
++        zeroContribution: [makeZero('test 1'), makeZero('test 2')],
++        hotLines: [], consolidationGroups: [],
+       },
+     });
+     const html = htmlReport(report);
+-    expect(html).toContain('badge-indigo');
+-    expect(html).toContain('merge-assertions');
++    expect(html).toContain('<div class="card-count">2</div>');
+   });
+ 
+-  it('fragile lines produce an amber "add test" badge', () => {
++  it('shows 0 for empty sections', () => {
++    const html = htmlReport(makeReport());
++    expect(html).toContain('<div class="card-count">0</div>');
++  });
++
++  it('each category shows its own count in the summary card', () => {
+     const report = makeReport({
+-      coverageDepth: {
+-        fragileLines: [{ source: 'src/a.ts', line: 1, coveredBy: 'sole test' }],
+-        uncoveredFunctions: [], lowCoverageFiles: [],
++      redundancy: {
++        highOverlapPairs: [],
++        zeroContribution: [makeZero('test 1'), makeZero('test 2')],
++        hotLines: [{ source: 'src/Foo.java', line: 1, coveredBy: 5 }],
++        consolidationGroups: [],
+       },
+     });
+     const html = htmlReport(report);
+-    expect(html).toContain('badge-amber');
+-    expect(html).toContain('add test');
++    // 2 zero-contribution, 1 hot
++    const counts = [...html.matchAll(/<div class="card-count">(\d+)<\/div>/g)].map(m => parseInt(m[1]));
++    expect(counts).toContain(2); // zero-contribution card
++    expect(counts).toContain(1); // hot lines card
+   });
++});
+ 
+-  it('uncovered functions produce an amber "check" badge', () => {
++// ─── Table rows: data-cat attributes ─────────────────────────────────────────
++describe('htmlReport — table rows', () => {
++  it('zero-contribution tests get data-cat="zero"', () => {
+     const report = makeReport({
+-      coverageDepth: {
+-        fragileLines: [],
+-        uncoveredFunctions: [{ source: 'src/a.ts', name: 'myFn', line: 10 }],
+-        lowCoverageFiles: [],
++      redundancy: {
++        highOverlapPairs: [],
++        zeroContribution: [makeZero('my redundant test', 'the big test')],
++        hotLines: [], consolidationGroups: [],
+       },
+     });
+     const html = htmlReport(report);
+-    expect(html).toContain('badge-amber');
+-    expect(html).toContain('check');
++    expect(html).toContain('data-cat="zero"');
++    expect(html).toContain('my redundant test');
+   });
+ 
+-  it('zero-contribution tests produce a red badge', () => {
++  it('zero-contribution rows show the superset test in the detail column', () => {
+     const report = makeReport({
+       redundancy: {
+         highOverlapPairs: [],
+-        zeroContribution: [{ file: 'tests/a.ts', fullName: 'test X', title: 'test X', describePath: '', sourceLines: {} }],
++        zeroContribution: [makeZero('tiny test', 'the covering test')],
+         hotLines: [], consolidationGroups: [],
+       },
+     });
+     const html = htmlReport(report);
+-    expect(html).toContain('badge-red');
++    expect(html).toContain('the covering test');
+   });
+ 
+-  it('unknown action type falls back to grey "investigate" badge', () => {
+-    // An overlap pair where neither a nor b is fully contained → investigate
++  it('overlap pairs get data-cat="overlap" and show jaccard percentage', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [{
+-          a: 'test A', b: 'test B', jaccard: 0.85,
+-          sharedLines: 5, aLines: 7, bLines: 8, // partial overlap — neither fully inside
+-        }],
++        highOverlapPairs: [{ a: 'test alpha', b: 'test beta', jaccard: 0.93, sharedLines: 8, aLines: 10, bLines: 9 }],
+         zeroContribution: [], hotLines: [], consolidationGroups: [],
+       },
+     });
+     const html = htmlReport(report);
+-    expect(html).toContain('badge-grey');
+-    expect(html).toContain('investigate');
++    expect(html).toContain('data-cat="overlap"');
++    expect(html).toContain('93.0%');
++    expect(html).toContain('test alpha');
++    expect(html).toContain('test beta');
+   });
+-});
+ 
+-// ─── overlapAction logic ─────────────────────────────────────────────────────
+-describe('htmlReport — overlapAction', () => {
+-  it('shows "delete a?" when all of A\'s lines are shared (A fully inside B)', () => {
+-    // aLines === sharedLines means A is fully covered by B's lines
++  it('formats jaccard=0.857 as 85.7%', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [{
+-          a: 'test A', b: 'test B', jaccard: 0.8,
+-          sharedLines: 5, aLines: 5, bLines: 8,
+-        }],
++        highOverlapPairs: [{ a: 'A', b: 'B', jaccard: 0.857142, sharedLines: 6, aLines: 7, bLines: 7 }],
+         zeroContribution: [], hotLines: [], consolidationGroups: [],
+       },
+     });
+-    const html = htmlReport(report);
+-    expect(html).toContain('delete a?');
+-    expect(html).toContain('badge-red');
++    expect(htmlReport(report)).toContain('85.7%');
+   });
+ 
+-  it('shows "delete b?" when all of B\'s lines are shared (B fully inside A)', () => {
++  it('jaccard=1.0 pairs are excluded from the table', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [{
+-          a: 'test A', b: 'test B', jaccard: 0.8,
+-          sharedLines: 5, aLines: 8, bLines: 5,
+-        }],
++        highOverlapPairs: [{ a: 'dup A', b: 'dup B', jaccard: 1.0, sharedLines: 5, aLines: 5, bLines: 5 }],
+         zeroContribution: [], hotLines: [], consolidationGroups: [],
+       },
+     });
+     const html = htmlReport(report);
+-    expect(html).toContain('delete b?');
++    expect(html).not.toContain('dup A');
++    expect(html).not.toContain('dup B');
+   });
+ 
+-  it('shows "investigate" in the table row when neither a nor b is fully contained', () => {
++  it('consolidation groups get data-cat="consolidate"', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [{
+-          a: 'test A', b: 'test B', jaccard: 0.8,
+-          sharedLines: 4, aLines: 6, bLines: 6,
+-        }],
+-        zeroContribution: [], hotLines: [], consolidationGroups: [],
++        highOverlapPairs: [], zeroContribution: [], hotLines: [],
++        consolidationGroups: [{ file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B'], suggestion: 'it.each' }],
+       },
+     });
+-    const html = htmlReport(report);
+-    // badge guide always contains all three action labels; check the count
+-    // deleteACount=0 and deleteBCount=0 → their badge guide entries show (0)
+-    expect(html).toMatch(/delete a\?<\/span>.*?\(0\)/s);
+-    expect(html).toMatch(/delete b\?<\/span>.*?\(0\)/s);
+-    expect(html).toMatch(/investigate<\/span>.*?\(1\)/s);
++    expect(htmlReport(report)).toContain('data-cat="consolidate"');
+   });
+ 
+-  it('filters out jaccard=1.0 pairs from the overlap table', () => {
++  it('hot lines get data-cat="hot"', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [{
+-          a: 'identical A', b: 'identical B', jaccard: 1.0,
+-          sharedLines: 5, aLines: 5, bLines: 5,
+-        }],
+-        zeroContribution: [], hotLines: [], consolidationGroups: [],
++        highOverlapPairs: [], zeroContribution: [],
++        hotLines: [{ source: 'src/Foo.java', line: 42, coveredBy: 12 }],
++        consolidationGroups: [],
+       },
+     });
+     const html = htmlReport(report);
+-    // The pair has jaccard=1.0 so it's filtered from partialOverlapPairs
+-    expect(html).not.toContain('identical A');
+-    expect(html).not.toContain('identical B');
++    expect(html).toContain('data-cat="hot"');
++    expect(html).toContain('src/Foo.java');
+   });
+ 
+-  it('includes pairs with jaccard < 1.0 in the overlap table', () => {
++  it('fragile lines get data-cat="fragile"', () => {
+     const report = makeReport({
+-      redundancy: {
+-        highOverlapPairs: [{
+-          a: 'test alpha', b: 'test beta', jaccard: 0.95,
+-          sharedLines: 8, aLines: 9, bLines: 8,
+-        }],
+-        zeroContribution: [], hotLines: [], consolidationGroups: [],
++      coverageDepth: {
++        fragileLines: [{ source: 'src/Bar.java', line: 7, coveredBy: 'sole test' }],
++        uncoveredFunctions: [], lowCoverageFiles: [],
+       },
+     });
+     const html = htmlReport(report);
+-    expect(html).toContain('test alpha');
+-    expect(html).toContain('test beta');
++    expect(html).toContain('data-cat="fragile"');
++    expect(html).toContain('src/Bar.java');
+   });
+ });
+ 
+-// ─── Jaccard percentage formatting ───────────────────────────────────────────
+-describe('htmlReport — jaccard percentage', () => {
+-  it('formats jaccard as percentage with 1 decimal place', () => {
++// ─── Recommendations ──────────────────────────────────────────────────────────
++describe('htmlReport — recommendation text', () => {
++  it('zero-contribution recommendation says "consider deleting or merging assertions"', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [{
+-          a: 'test A', b: 'test B', jaccard: 0.93,
+-          sharedLines: 8, aLines: 10, bLines: 9,
+-        }],
+-        zeroContribution: [], hotLines: [], consolidationGroups: [],
++        highOverlapPairs: [],
++        zeroContribution: [makeZero('test X')],
++        hotLines: [], consolidationGroups: [],
+       },
+     });
+-    const html = htmlReport(report);
+-    expect(html).toContain('93.0%');
++    expect(htmlReport(report).toLowerCase()).toContain('consider deleting or merging assertions');
+   });
+ 
+-  it('formats jaccard=0.857 as 85.7%', () => {
++  it('overlap where A is inside B recommends removing A', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [{
+-          a: 'test A', b: 'test B', jaccard: 0.857142,
+-          sharedLines: 6, aLines: 7, bLines: 7,
+-        }],
++        highOverlapPairs: [{ a: 'test small', b: 'test large', jaccard: 0.9, sharedLines: 5, aLines: 5, bLines: 8 }],
+         zeroContribution: [], hotLines: [], consolidationGroups: [],
+       },
+     });
+-    const html = htmlReport(report);
+-    expect(html).toContain('85.7%');
++    expect(htmlReport(report).toLowerCase()).toMatch(/consider removing a|remove a/);
+   });
+-});
+ 
+-// ─── topN note ───────────────────────────────────────────────────────────────
+-describe('htmlReport — topN note', () => {
+-  it('shows "Showing top N of M" when total >= topN', () => {
+-    const fragileLines = Array.from({ length: 5 }, (_, i) => ({
+-      source: 'src/a.ts', line: i + 1, coveredBy: `test ${i}`,
+-    }));
++  it('overlap where B is inside A recommends removing B', () => {
+     const report = makeReport({
+-      coverageDepth: { fragileLines, uncoveredFunctions: [], lowCoverageFiles: [] },
++      redundancy: {
++        highOverlapPairs: [{ a: 'test large', b: 'test small', jaccard: 0.9, sharedLines: 5, aLines: 8, bLines: 5 }],
++        zeroContribution: [], hotLines: [], consolidationGroups: [],
++      },
+     });
+-    const html = htmlReport(report, { topN: 5 });
+-    expect(html).toContain('Showing top 5 of 5');
++    expect(htmlReport(report).toLowerCase()).toMatch(/consider removing b|remove b/);
+   });
+ 
+-  it('shows topN note when total > topN', () => {
+-    const fragileLines = Array.from({ length: 10 }, (_, i) => ({
+-      source: 'src/a.ts', line: i + 1, coveredBy: `test ${i}`,
+-    }));
++  it('partial overlap recommends investigating', () => {
+     const report = makeReport({
+-      coverageDepth: { fragileLines, uncoveredFunctions: [], lowCoverageFiles: [] },
++      redundancy: {
++        highOverlapPairs: [{ a: 'test A', b: 'test B', jaccard: 0.8, sharedLines: 4, aLines: 6, bLines: 6 }],
++        zeroContribution: [], hotLines: [], consolidationGroups: [],
++      },
+     });
+-    const html = htmlReport(report, { topN: 3 });
+-    expect(html).toContain('Showing top 3 of 10');
++    expect(htmlReport(report).toLowerCase()).toContain('investigat');
+   });
+ 
+-  it('does NOT show topN note when total < topN', () => {
+-    const fragileLines = [{ source: 'src/a.ts', line: 1, coveredBy: 'x' }];
++  it('fragile line recommendation mentions adding a second test', () => {
+     const report = makeReport({
+-      coverageDepth: { fragileLines, uncoveredFunctions: [], lowCoverageFiles: [] },
++      coverageDepth: {
++        fragileLines: [{ source: 'src/a.ts', line: 1, coveredBy: 'sole test' }],
++        uncoveredFunctions: [], lowCoverageFiles: [],
++      },
+     });
+-    const html = htmlReport(report, { topN: 5 });
+-    expect(html).not.toContain('Showing top');
++    expect(htmlReport(report).toLowerCase()).toMatch(/add a second|add another/);
+   });
+-});
+ 
+-// ─── Consolidation savings text ───────────────────────────────────────────────
+-describe('htmlReport — consolidation savings', () => {
+-  it('shows singular "−1 test" when group has 2 tests', () => {
++  it('hot line recommendation mentions redundant coverage or variations', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
+-        consolidationGroups: [{
+-          file: 'tests/foo.test.ts', describePath: 'g',
+-          tests: ['g > A', 'g > B'], // 2 tests → savings = 1
+-          suggestion: 'it.each',
+-        }],
++        highOverlapPairs: [], zeroContribution: [],
++        hotLines: [{ source: 'src/x.ts', line: 1, coveredBy: 20 }],
++        consolidationGroups: [],
+       },
+     });
+-    const html = htmlReport(report);
+-    expect(html).toContain('−1 test');
+-    expect(html).not.toContain('−1 tests');
++    expect(htmlReport(report).toLowerCase()).toMatch(/redundant|variations/);
+   });
+ 
+-  it('shows plural "−2 tests" when group has 3 tests', () => {
++  it('does NOT include old "saving X tests" impact text', () => {
+     const report = makeReport({
+       redundancy: {
+         highOverlapPairs: [], zeroContribution: [], hotLines: [],
+-        consolidationGroups: [{
+-          file: 'tests/foo.test.ts', describePath: 'g',
+-          tests: ['g > A', 'g > B', 'g > C'], // 3 tests → savings = 2
+-          suggestion: 'it.each',
+-        }],
++        consolidationGroups: [{ file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B', 'x > C'], suggestion: 'it.each' }],
+       },
+     });
+     const html = htmlReport(report);
+-    expect(html).toContain('−2 tests');
++    expect(html).not.toContain('class="impact"');
++    expect(html).not.toMatch(/saving \d+ tests/i);
+   });
+ });
+ 
+-// ─── Low coverage percentage formatting ──────────────────────────────────────
+-describe('htmlReport — low coverage file formatting', () => {
+-  it('formats lineCoverage with 1 decimal place', () => {
++// ─── Badge colours ────────────────────────────────────────────────────────────
++describe('htmlReport — category badge colours', () => {
++  it('zero-contribution rows use grey badge', () => {
+     const report = makeReport({
+-      coverageDepth: {
+-        fragileLines: [], uncoveredFunctions: [],
+-        lowCoverageFiles: [{ source: 'src/legacy.ts', lineCoverage: 42.567 }],
++      redundancy: {
++        highOverlapPairs: [],
++        zeroContribution: [makeZero('test X')],
++        hotLines: [], consolidationGroups: [],
+       },
+     });
+-    const html = htmlReport(report);
+-    expect(html).toContain('42.6%');
+-    expect(html).toContain('src/legacy.ts');
++    expect(htmlReport(report)).toContain('badge-grey');
+   });
+ 
+-  it('formats whole-number coverage correctly', () => {
++  it('hot line rows use red badge', () => {
+     const report = makeReport({
+-      coverageDepth: {
+-        fragileLines: [], uncoveredFunctions: [],
+-        lowCoverageFiles: [{ source: 'src/old.ts', lineCoverage: 70 }],
++      redundancy: {
++        highOverlapPairs: [], zeroContribution: [],
++        hotLines: [{ source: 'src/x.ts', line: 1, coveredBy: 10 }],
++        consolidationGroups: [],
+       },
+     });
+-    const html = htmlReport(report);
+-    expect(html).toContain('70.0%');
++    expect(htmlReport(report)).toContain('badge-red');
+   });
+-});
+ 
+-// ─── Badge guide counts ───────────────────────────────────────────────────────
+-describe('htmlReport — badge guide counts', () => {
+-  it('shows correct count for it.each groups in badge guide', () => {
++  it('fragile line rows use amber badge', () => {
+     const report = makeReport({
+-      redundancy: {
+-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
+-        consolidationGroups: [
+-          { file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B'], suggestion: 'it.each' },
+-          { file: 'b.ts', describePath: 'y', tests: ['y > A', 'y > B'], suggestion: 'merge-assertions' },
+-        ],
++      coverageDepth: {
++        fragileLines: [{ source: 'src/a.ts', line: 1, coveredBy: 'sole test' }],
++        uncoveredFunctions: [], lowCoverageFiles: [],
+       },
+     });
+-    const html = htmlReport(report);
+-    // badge guide shows "(1)" for it.each and "(1)" for merge-assertions
+-    expect(html).toContain('it.each');
+-    expect(html).toContain('merge-assertions');
+-    // both appear in the guide with count indicators
+-    const matches = html.match(/<strong>\((\d+)\)<\/strong>/g);
+-    expect(matches).not.toBeNull();
++    expect(htmlReport(report)).toContain('badge-amber');
+   });
+ 
+-  it('shows correct deleteA/deleteB/investigate counts in overlap badge guide', () => {
++  it('overlap rows use indigo badge', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [
+-          { a: 'A', b: 'B', jaccard: 0.9, sharedLines: 5, aLines: 5, bLines: 7 }, // delete a?
+-          { a: 'C', b: 'D', jaccard: 0.9, sharedLines: 4, aLines: 6, bLines: 4 }, // delete b?
+-          { a: 'E', b: 'F', jaccard: 0.9, sharedLines: 3, aLines: 5, bLines: 5 }, // investigate
+-        ],
++        highOverlapPairs: [{ a: 'A', b: 'B', jaccard: 0.9, sharedLines: 5, aLines: 7, bLines: 7 }],
+         zeroContribution: [], hotLines: [], consolidationGroups: [],
+       },
+     });
+-    const html = htmlReport(report);
+-    expect(html).toContain('delete a?');
+-    expect(html).toContain('delete b?');
+-    expect(html).toContain('investigate');
++    expect(htmlReport(report)).toContain('badge-indigo');
+   });
+-});
+ 
+-// ─── Summary card counts ──────────────────────────────────────────────────────
+-describe('htmlReport — summary cards', () => {
+-  it('summary grid includes correct count for zero-contribution tests', () => {
++  it('consolidation rows use blue badge', () => {
+     const report = makeReport({
+       redundancy: {
+-        highOverlapPairs: [],
+-        zeroContribution: [
+-          { file: 'a.ts', fullName: 'test 1', title: 'test 1', describePath: '', sourceLines: {} },
+-          { file: 'b.ts', fullName: 'test 2', title: 'test 2', describePath: '', sourceLines: {} },
+-        ],
+-        hotLines: [], consolidationGroups: [],
++        highOverlapPairs: [], zeroContribution: [], hotLines: [],
++        consolidationGroups: [{ file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B'], suggestion: 'it.each' }],
+       },
+     });
+-    const html = htmlReport(report);
+-    // Summary card for zero shows count "2"
+-    expect(html).toContain('<div class="card-count">2</div>');
++    expect(htmlReport(report)).toContain('badge-blue');
+   });
++});
+ 
+-  it('summary grid shows 0 for empty sections', () => {
++// ─── Tooltips ─────────────────────────────────────────────────────────────────
++describe('htmlReport — card tooltips', () => {
++  it('zero-contribution card has a descriptive tooltip mentioning larger test', () => {
+     const html = htmlReport(makeReport());
+-    expect(html).toContain('<div class="card-count">0</div>');
++    expect(html).toMatch(/title="[^"]*larger test[^"]*"/i);
+   });
+-});
+ 
+-// ─── Consolidation impact line removed ───────────────────────────────────────
+-describe('htmlReport — consolidation impact text', () => {
+-  it('does NOT show the misleading "saving X tests" impact paragraph', () => {
+-    const report = makeReport({
+-      redundancy: {
+-        highOverlapPairs: [], zeroContribution: [], hotLines: [],
+-        consolidationGroups: [
+-          { file: 'a.ts', describePath: 'x', tests: ['x > A', 'x > B', 'x > C'], suggestion: 'it.each' },
+-        ],
+-      },
+-    });
+-    const html = htmlReport(report);
+-    expect(html).not.toContain('class="impact"');
+-    expect(html).not.toMatch(/saving \d+ tests/i);
++  it('hot lines card has a descriptive tooltip mentioning many tests', () => {
++    const html = htmlReport(makeReport());
++    expect(html).toMatch(/title="[^"]*many tests[^"]*"/i);
++  });
++
++  it('fragile lines card has a descriptive tooltip mentioning single test', () => {
++    const html = htmlReport(makeReport());
++    expect(html).toMatch(/title="[^"]*single test[^"]*"/i);
+   });
+-});
+ 
+-// ─── Tips blocks ──────────────────────────────────────────────────────────────
+-describe('htmlReport — tips blocks', () => {
+-  it('each section renders a <details class="tips"> element', () => {
++  it('overlap card has a descriptive tooltip mentioning shared lines', () => {
+     const html = htmlReport(makeReport());
+-    const count = (html.match(/<details class="tips">/g) ?? []).length;
+-    expect(count).toBe(7);
++    expect(html).toMatch(/title="[^"]*shared lines[^"]*"/i);
+   });
+ 
+-  it('summary label is "How to use this" in every section', () => {
++  it('consolidation card has a descriptive tooltip mentioning identical', () => {
+     const html = htmlReport(makeReport());
+-    const count = (html.match(/<summary>How to use this<\/summary>/g) ?? []).length;
+-    expect(count).toBe(7);
++    expect(html).toMatch(/title="[^"]*identical[^"]*"/i);
+   });
+ 
+-  it('<details> has no open attribute — collapsed by default', () => {
++  it('dead controllers card tooltip mentions routes when play data provided', () => {
++    const html = htmlReport(makeReport(), {}, { controllers: [] });
++    expect(html).toMatch(/title="[^"]*routes[^"]*"/i);
++  });
++});
++
++// ─── Intro text ───────────────────────────────────────────────────────────────
++describe('htmlReport — intro text', () => {
++  it('contains an intro paragraph above the summary grid', () => {
+     const html = htmlReport(makeReport());
+-    expect(html).not.toContain('<details class="tips" open>');
+-    expect(html).not.toContain('<details open');
++    expect(html).toContain('class="intro"');
+   });
+ 
+-  it('tips content appears in the zero-contribution section', () => {
++  it('intro text mentions per-test coverage', () => {
+     const html = htmlReport(makeReport());
+-    expect(html).toContain("Don't just delete");
++    const introIdx = html.indexOf('class="intro"');
++    expect(introIdx).toBeGreaterThan(-1);
++    const snippet = html.slice(introIdx, introIdx + 400);
++    expect(snippet.toLowerCase()).toContain('per-test');
+   });
+ 
+-  it('tips content appears in the low-coverage section', () => {
++  it('intro text appears before the summary grid', () => {
+     const html = htmlReport(makeReport());
+-    expect(html).toContain('Focus here first when adding new tests');
++    const introIdx = html.indexOf('class="intro"');
++    const gridIdx  = html.indexOf('class="summary-grid"');
++    expect(introIdx).toBeLessThan(gridIdx);
+   });
+ });
+ 
+-// ─── Empty sections ───────────────────────────────────────────────────────────
+-describe('htmlReport — empty section fallback', () => {
+-  it('shows "No findings." for sections with no data', () => {
++// ─── Play controller analysis ─────────────────────────────────────────────────
++describe('htmlReport — Play controller analysis', () => {
++  const playData = {
++    controllers: [
++      { relativePath: 'app/controllers/HomeController.java', simpleName: 'HomeController', status: 'routed' as const,       refs: { inRoutes: true,  inViews: false, inJava: false, inTests: false } },
++      { relativePath: 'app/controllers/DeadController.java', simpleName: 'DeadController', status: 'unreferenced' as const, refs: { inRoutes: false, inViews: false, inJava: false, inTests: false } },
++      { relativePath: 'app/controllers/TestOnlyCtrl.java',   simpleName: 'TestOnlyCtrl',   status: 'test-only' as const,    refs: { inRoutes: false, inViews: false, inJava: false, inTests: true  } },
++    ],
++  };
++
++  it('renders dead controller rows when play data is provided', () => {
++    const html = htmlReport(makeReport(), {}, playData);
++    expect(html).toContain('DeadController');
++    expect(html).toContain('TestOnlyCtrl');
++  });
++
++  it('does NOT render dead controller rows when play data is absent', () => {
+     const html = htmlReport(makeReport());
+-    expect(html).toContain('No findings.');
++    expect(html).not.toContain('data-cat="dead"');
++    expect(html).not.toContain('Dead controllers');
++  });
++
++  it('dead controller rows have data-cat="dead"', () => {
++    const html = htmlReport(makeReport(), {}, playData);
++    expect(html).toContain('data-cat="dead"');
++  });
++
++  it('unreferenced controllers get a red status badge', () => {
++    const html = htmlReport(makeReport(), {}, playData);
++    const deadIdx = html.indexOf('DeadController');
++    const snippet = html.slice(Math.max(0, deadIdx - 400), deadIdx + 400);
++    expect(snippet).toMatch(/badge-red/);
++  });
++
++  it('test-only controllers get an amber status badge', () => {
++    const html = htmlReport(makeReport(), {}, playData);
++    const idx = html.indexOf('TestOnlyCtrl');
++    const snippet = html.slice(Math.max(0, idx - 400), idx + 400);
++    expect(snippet).toMatch(/badge-amber/);
++  });
++
++  it('routed controllers do NOT appear in dead rows', () => {
++    const html = htmlReport(makeReport(), {}, playData);
++    // Find all data-cat="dead" rows and check none contain HomeController
++    const deadSection = html.match(/data-cat="dead"[\s\S]*?<\/tr>/g) ?? [];
++    expect(deadSection.every(r => !r.includes('HomeController'))).toBe(true);
++  });
++
++  it('dead controller recommendation says "consider removing" for unreferenced', () => {
++    const html = htmlReport(makeReport(), {}, playData);
++    expect(html.toLowerCase()).toContain('consider removing');
+   });
+ });

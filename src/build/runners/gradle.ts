@@ -6,7 +6,6 @@ import type { Runner, TestCase } from '../index.js';
 import { parseModules, moduleToPath, pathToModule, findGradleCommand } from './gradle/settings.js';
 import { parseJacocoXml, mergeIstanbulMaps } from './gradle/jacoco.js';
 import { generateInitScript, detectJacoco } from './gradle/init-script.js';
-import { ensureListenerJar } from '../../setup/gradle-listener.js';
 
 // Session state — initialised lazily by whichever method is called first
 let _gradleCmd: string | undefined;
@@ -272,13 +271,13 @@ function scanJacocoXml(dir: string): string[] {
   return xmlFiles;
 }
 
-/** Full Istanbul conversion — used by aggregate() where fnMap/branchMap are needed. */
+/** Full Istanbul conversion — used by both runOne() and aggregate(). */
 function mergeJacocoDir(dir: string, projectRoot: string): void {
   fs.mkdirSync(dir, { recursive: true });
   const xmlFiles = scanJacocoXml(dir);
 
   if (xmlFiles.length === 0) {
-    process.stderr.write(`  coverage-insights: no jacoco.xml found in ${dir} — aggregate coverage will be empty\n`);
+    process.stderr.write(`  coverage-insights: no jacoco.xml found in ${dir} — coverage will be empty\n`);
     fs.writeFileSync(path.join(dir, 'coverage-final.json'), '{}', 'utf8');
     return;
   }
@@ -293,7 +292,6 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
   const merged = mergeIstanbulMaps(maps);
   fs.writeFileSync(path.join(dir, 'coverage-final.json'), JSON.stringify(merged), 'utf8');
 }
-
 
 export const gradleRunner: Runner = {
   // Gradle incurs JVM startup overhead per test; keep concurrency low by default.
@@ -358,35 +356,31 @@ export const gradleRunner: Runner = {
     mergeJacocoDir(workerDir, projectRoot);
   },
 
-  async runAll(projectRoot, workDir) {
+  async runAll(projectRoot: string, workDir: string, testCases?: TestCase[]): Promise<void> {
     ensureSession(projectRoot);
-    const gradleCmd = _gradleCmd!;
+    const gradleCmd  = _gradleCmd!;
     const initScript = _initScriptPath!;
     fs.mkdirSync(workDir, { recursive: true });
-    const listenerJar = ensureListenerJar(projectRoot);
-
-    // Single test invocation — listener dumps .exec per test
+    // Write filter file so batchConvert only processes the discovered test subset.
+    if (testCases && testCases.length > 0) {
+      const filterNames = testCases.map(tc =>
+        (tc.describePath + '.' + tc.title).replace(/[^a-zA-Z0-9._-]/g, '_'),
+      );
+      fs.writeFileSync(path.join(workDir, '.ci-filter.txt'), filterNames.join('\n'), 'utf8');
+    }
+    // PID-based port avoids conflicts if two coverage-insights processes run simultaneously.
+    const port = 6300 + (process.pid % 1000);
     await new Promise<void>(resolve => {
       execFile(gradleCmd, [
-        'test',
+        ':test',
         '--no-daemon',
         '--init-script', initScript,
         `-Pcoverage.insights.pertest.dir=${workDir}`,
-        `-Pcoverage.insights.listener.jar=${listenerJar}`,
-      ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, () => resolve());  // swallow errors — test failures OK
+        `-Pcoverage.insights.pertest.port=${port}`,
+      ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, () => resolve()); // swallow errors — test failures OK
     });
-
-    // Batch conversion — reads .exec files, writes coverage-final.json
-    await new Promise<void>((resolve, reject) => {
-      execFile(gradleCmd, [
-        'coverageInsightsBatchReport',
-        '--no-daemon',
-        '--init-script', initScript,
-        `-Pcoverage.insights.pertest.dir=${workDir}`,
-      ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, err => {
-        if (err) reject(err); else resolve();
-      });
-    });
+    // batchConvert runs inline in the Gradle process via the TestListener's afterSuite hook,
+    // writing per-test JSON files to workDir. No second Gradle invocation needed.
   },
 
   async aggregate(projectRoot, aggregateDir, _configPath) {

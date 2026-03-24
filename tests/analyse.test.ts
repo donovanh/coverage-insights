@@ -118,6 +118,16 @@ describe('zero contribution', () => {
     expect(report.redundancy.zeroContribution).toHaveLength(0);
   });
 
+  it('includes supersetTest name on the zero-contribution entry', () => {
+    const map = makeMap([
+      { file: 'tests/foo.test.ts', fullName: 'main test', sourceLines: { [SRC_A]: [1,2,3,4,5] } },
+      { file: 'tests/foo.test.ts', fullName: 'redundant test', sourceLines: { [SRC_A]: [2,3] } },
+    ]);
+    const report = analyse(map, EMPTY_SUMMARY);
+    const entry = report.redundancy.zeroContribution[0] as import('../src/types.js').ZeroContributionEntry;
+    expect(entry.supersetTest).toBe('main test');
+  });
+
   it('requires superset to have strictly MORE lines, not equal', () => {
     // superset check is `other.lines.size > lines.size` — equal size with same lines is NOT a superset
     const map = makeMap([

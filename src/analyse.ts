@@ -3,6 +3,7 @@ import type {
   CoverageSummary,
   AnalysisOptions,
   AnalysisReport,
+  ZeroContributionEntry,
   OverlapPair,
   ConsolidationGroup,
   HotLine,
@@ -80,14 +81,14 @@ export function analyse(
 
   // ── Zero contribution: only flag if another test is a STRICT superset ──
   // (covers all same lines AND has more lines — avoids flagging identical-coverage tests)
-  const zeroContribution: TestEntry[] = [];
+  const zeroContribution: ZeroContributionEntry[] = [];
   for (const { entry, lines } of scoped) {
     if (lines.size === 0) continue;
-    const isSubsumed = scoped.some(other => {
+    const superset = scoped.find(other => {
       if (other.entry.fullName === entry.fullName) return false;
       return other.lines.size > lines.size && [...lines].every(l => other.lines.has(l));
     });
-    if (isSubsumed) zeroContribution.push(entry);
+    if (superset) zeroContribution.push({ ...entry, supersetTest: superset.entry.fullName });
   }
 
   // ── Hot lines ──

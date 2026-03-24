@@ -9,6 +9,7 @@ export interface BuildOptions {
   projectRoot: string;
   outDir: string;
   concurrency?: number;
+  noAggregate?: boolean;
   fileFilter?: string;
   configPath?: string;
 }
@@ -21,9 +22,8 @@ export interface BuildResult {
 export interface Runner {
   discover(projectRoot: string, fileFilter: string | undefined, configPath: string | undefined): Promise<TestCase[]>;
   runOne(tc: TestCase, projectRoot: string, workerDir: string, configPath: string | undefined): Promise<void>;
+  runAll?(projectRoot: string, workDir: string, testCases?: TestCase[]): Promise<void>;
   aggregate(projectRoot: string, aggregateDir: string, configPath: string | undefined): Promise<void>;
-  /** Batch mode: single Gradle invocation, listener dumps per-test exec files, batchConvert produces coverage-final.json */
-  runAll?(projectRoot: string, workDir: string): Promise<void>;
   /** Override the default concurrency for this runner. If omitted, the CPU-based default is used. */
   defaultConcurrency?: number;
 }
@@ -86,10 +86,33 @@ function buildCoverageSummary(coverageFinal: Record<string, unknown>): CoverageS
 }
 
 const CPU_CONCURRENCY = Math.max(1, Math.min(Math.floor(os.cpus().length / 2), 10));
-
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-function startBatchSpinner(isTTY: boolean, testCount: number): () => void {
+function startBatchSpinner(isTTY: boolean, testCount: number, batchDir: string): () => void {
+  let lastPollTime = 0;
+  let peakExec = 0;
+  let currentExec = 0;
+  function pollExec() {
+    const now = Date.now();
+    if (now - lastPollTime < 5000) return;
+    lastPollTime = now;
+    try {
+      const files = fs.readdirSync(batchDir);
+      const execCount = files.filter(f => f.endsWith('.exec')).length;
+      if (execCount > peakExec) peakExec = execCount;
+      currentExec = execCount;
+    } catch { /* ignore */ }
+  }
+  function formatEta(elapsedSecs: number): string {
+    if (peakExec === 0 || elapsedSecs === 0) return '';
+    const processed = peakExec - currentExec;
+    if (processed <= 0) return '';
+    const rate = processed / elapsedSecs;
+    const remainingSecs = Math.round(currentExec / rate);
+    const rm = Math.floor(remainingSecs / 60);
+    const rs = remainingSecs % 60;
+    return rm > 0 ? `~${rm}m ${rs}s remaining` : `~${rs}s remaining`;
+  }
   if (!isTTY) {
     process.stderr.write(`  Running ${testCount} tests in batch mode...\n`);
     return () => {};
@@ -97,11 +120,11 @@ function startBatchSpinner(isTTY: boolean, testCount: number): () => void {
   const start = Date.now();
   let frame = 0;
   const write = () => {
-    const secs = Math.round((Date.now() - start) / 1000);
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    const t = m > 0 ? `${m}m ${s}s` : `${s}s`;
-    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Batch test run (${testCount} tests)... ${t} elapsed`.padEnd(80));
+    pollExec();
+    const secs = (Date.now() - start) / 1000;
+    const eta = formatEta(secs);
+    const etaStr = eta ? `, ${eta}` : '';
+    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Batch test run (${testCount} tests)... ${formatElapsed(start)}${etaStr}`.padEnd(80));
     frame++;
   };
   write();
@@ -110,6 +133,16 @@ function startBatchSpinner(isTTY: boolean, testCount: number): () => void {
     clearInterval(timer);
     process.stderr.write(`\r${' '.repeat(80)}\r`);
   };
+}
+
+function formatElapsed(startMs: number): string {
+  const ms = Date.now() - startMs;
+  const secs = ms / 1000;
+  if (secs < 10) return `${secs.toFixed(1)}s`;
+  const whole = Math.round(secs);
+  const m = Math.floor(whole / 60);
+  const s = whole % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
 function startAggregateSpinner(isTTY: boolean): () => void {
@@ -120,11 +153,7 @@ function startAggregateSpinner(isTTY: boolean): () => void {
   const start = Date.now();
   let frame = 0;
   const write = () => {
-    const secs = Math.round((Date.now() - start) / 1000);
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    const t = m > 0 ? `${m}m ${s}s` : `${s}s`;
-    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Aggregate coverage pass... ${t} elapsed`.padEnd(80));
+    process.stderr.write(`\r  ${SPINNER_FRAMES[frame % SPINNER_FRAMES.length]} Aggregate coverage pass... ${formatElapsed(start)}`.padEnd(80));
     frame++;
   };
   write();
@@ -135,51 +164,31 @@ function startAggregateSpinner(isTTY: boolean): () => void {
   };
 }
 
-function safeFileName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '_');
+/** Sanitise a string to a safe file name, matching the Kotlin batchConvert naming. */
+function safeFileName(s: string): string {
+  return s.replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
-export function batchOutputToMap(
-  batchRaw: Record<string, Record<string, number[]>>,
-  testCases: TestCase[],
-  projectRoot: string,
-): TestLineMap {
-  const tcByKey = new Map<string, TestCase>();
-  for (const tc of testCases) {
-    const key = safeFileName(`${tc.describePath}.${tc.title}`);
-    if (tcByKey.has(key)) {
-      process.stderr.write(`  coverage-insights: safeFileName collision for key "${key}" — one test's coverage may be lost\n`);
+/** Write a large JSON object entry-by-entry to avoid V8 string length limits. */
+function streamWriteJson(filePath: string, obj: Record<string, unknown>): void {
+  const fd = fs.openSync(filePath, 'w');
+  try {
+    fs.writeSync(fd, '{\n');
+    const entries = Object.entries(obj);
+    for (let i = 0; i < entries.length; i++) {
+      const line = '  ' + JSON.stringify(entries[i][0]) + ': ' + JSON.stringify(entries[i][1])
+        + (i < entries.length - 1 ? ',' : '') + '\n';
+      fs.writeSync(fd, line);
     }
-    tcByKey.set(key, tc);
+    fs.writeSync(fd, '}\n');
+  } finally {
+    fs.closeSync(fd);
   }
-  const map: TestLineMap = {};
-  let unmatchedCount = 0;
-  for (const [testKey, fileLines] of Object.entries(batchRaw)) {
-    const tc = tcByKey.get(testKey);
-    if (!tc) { unmatchedCount++; continue; }
-    const sourceLines: Record<string, number[]> = {};
-    for (const [absPath, lines] of Object.entries(fileLines)) {
-      if (lines.length > 0) sourceLines[shortPath(absPath, projectRoot)] = lines;
-    }
-    if (Object.keys(sourceLines).length === 0) continue;
-    const key = `${shortPath(tc.filePath, projectRoot)} > ${tc.fullName}`;
-    map[key] = {
-      file: shortPath(tc.filePath, projectRoot),
-      fullName: tc.fullName,
-      title: tc.title,
-      describePath: tc.describePath,
-      sourceLines,
-    };
-  }
-  if (unmatchedCount > 0) {
-    process.stderr.write(`  coverage-insights: ${unmatchedCount} batch output keys had no matching test — parameterized tests or JUnit 5 tests are not supported in batch mode\n`);
-  }
-  return map;
 }
 
 export async function build(opts: BuildOptions, runner: Runner): Promise<BuildResult> {
   const defaultConcurrency = runner.defaultConcurrency ?? CPU_CONCURRENCY;
-  const { projectRoot, outDir, concurrency = defaultConcurrency, fileFilter, configPath } = opts;
+  const { projectRoot, outDir, concurrency = defaultConcurrency, noAggregate, fileFilter, configPath } = opts;
 
   fs.mkdirSync(outDir, { recursive: true });
 
@@ -193,29 +202,49 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
   let map: TestLineMap = {};
 
   if (runner.runAll) {
-    // ── Step 2 (batch): single Gradle invocation ────────────────────────────
+    // ── Step 2 (batch): single Gradle invocation ──────────────────────────────
     const batchDir = path.join(outDir, 'batch');
     fs.mkdirSync(batchDir, { recursive: true });
-    const stopBatch = startBatchSpinner(isTTY, testCases.length);
+    const stopBatch = startBatchSpinner(isTTY, testCases.length, batchDir);
     try {
-      await runner.runAll(projectRoot, batchDir);
+      await runner.runAll(projectRoot, batchDir, testCases);
       stopBatch();
-      const batchPath = path.join(batchDir, 'coverage-final.json');
-      if (fs.existsSync(batchPath)) {
-        const batchRaw = JSON.parse(fs.readFileSync(batchPath, 'utf8')) as Record<string, Record<string, number[]>>;
-        map = batchOutputToMap(batchRaw, testCases, projectRoot);
+      // Read one JSON file per test — no single large string ever created
+      const tcByKey = new Map<string, TestCase>();
+      for (const tc of testCases) {
+        const key = safeFileName(`${tc.describePath}.${tc.title}`);
+        tcByKey.set(key, tc);
+      }
+      let unmatchedBatch = 0;
+      for (const f of fs.readdirSync(batchDir)) {
+        if (!f.endsWith('.json') || f.startsWith('.')) continue;
+        const testKey = f.slice(0, -5);
+        const tc = tcByKey.get(testKey);
+        if (!tc) { unmatchedBatch++; continue; }
+        const fileLines = JSON.parse(fs.readFileSync(path.join(batchDir, f), 'utf8')) as Record<string, number[]>;
+        const sourceLines: Record<string, number[]> = {};
+        for (const [absPath, lines] of Object.entries(fileLines)) {
+          if (lines.length > 0) sourceLines[shortPath(absPath, projectRoot)] = lines;
+        }
+        if (Object.keys(sourceLines).length === 0) continue;
+        const key = `${shortPath(tc.filePath, projectRoot)} > ${tc.fullName}`;
+        map[key] = { file: shortPath(tc.filePath, projectRoot), fullName: tc.fullName, title: tc.title, describePath: tc.describePath, sourceLines };
+      }
+      if (unmatchedBatch > 0) {
+        process.stderr.write(`  coverage-insights: ${unmatchedBatch} batch output files had no matching test — parameterized tests or JUnit 5 tests are not supported in batch mode\n`);
+      } else {
+        process.stderr.write('  coverage-insights: batch conversion produced no output.\n' +
+          '  Check that JaCoCo jars are resolvable (jacocoAnt or buildscript classpath).\n');
       }
     } finally {
-      stopBatch();  // idempotent — clearInterval is safe to call twice
+      stopBatch(); // idempotent — clearInterval is safe to call twice
       fs.rmSync(batchDir, { recursive: true, force: true });
     }
   } else {
-    // ── Step 2 (per-test): worker pool ─────────────────────────────────────
+    // ── Step 2 (per-test): worker pool ────────────────────────────────────────
     if (isTTY) process.stderr.write(`  Running ${testCases.length} tests with concurrency=${concurrency}\n`);
-
     const tmpRoot = path.join(outDir, 'tmp-per-test');
     fs.mkdirSync(tmpRoot, { recursive: true });
-
     let idx = 0, done = 0;
     const total = testCases.length;
     const startTime = Date.now();
@@ -274,17 +303,21 @@ export async function build(opts: BuildOptions, runner: Runner): Promise<BuildRe
   // ── Step 3: Aggregate ────────────────────────────────────────────────────────
   const aggregateDir = path.join(outDir, 'aggregate');
   let summary: CoverageSummary = {};
-  const stopSpinner = startAggregateSpinner(isTTY);
-  await runner.aggregate(projectRoot, aggregateDir, configPath);
-  stopSpinner();
-  const aggregatePath = path.join(aggregateDir, 'coverage-final.json');
-  if (fs.existsSync(aggregatePath)) {
-    summary = buildCoverageSummary(JSON.parse(fs.readFileSync(aggregatePath, 'utf8')) as Record<string, unknown>);
+  if (noAggregate) {
+    if (isTTY) process.stderr.write('  Skipping aggregate pass (--no-aggregate).\n');
+  } else {
+    const stopSpinner = startAggregateSpinner(isTTY);
+    await runner.aggregate(projectRoot, aggregateDir, configPath);
+    stopSpinner();
+    const aggregatePath = path.join(aggregateDir, 'coverage-final.json');
+    if (fs.existsSync(aggregatePath)) {
+      summary = buildCoverageSummary(JSON.parse(fs.readFileSync(aggregatePath, 'utf8')) as Record<string, unknown>);
+    }
   }
 
   // ── Step 4: Write outputs ─────────────────────────────────────────────────
-  fs.writeFileSync(path.join(outDir, 'test-line-map.json'), JSON.stringify(map, null, 2));
-  fs.writeFileSync(path.join(outDir, 'coverage-summary.json'), JSON.stringify(summary, null, 2));
+  streamWriteJson(path.join(outDir, 'test-line-map.json'), map as unknown as Record<string, unknown>);
+  streamWriteJson(path.join(outDir, 'coverage-summary.json'), summary as unknown as Record<string, unknown>);
 
   return { map, summary };
 }

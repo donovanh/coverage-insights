@@ -1,0 +1,37 @@
+{
+  "test/helpers/FooHelperTest.java > com.example.FooHelperTest > testAdd": {
+    "file": "test/helpers/FooHelperTest.java",
+    "fullName": "com.example.FooHelperTest > testAdd",
+    "title": "testAdd",
+    "describePath": "com.example.FooHelperTest",
+    "sourceLines": { "app/helpers/FooHelper.java": [10, 11, 12, 13, 14] }
+  },
+  "test/helpers/FooHelperTest.java > com.example.FooHelperTest > testAddAlias": {
+    "file": "test/helpers/FooHelperTest.java",
+    "fullName": "com.example.FooHelperTest > testAddAlias",
+    "title": "testAddAlias",
+    "describePath": "com.example.FooHelperTest",
+    "sourceLines": { "app/helpers/FooHelper.java": [10, 11, 12, 13, 14] }
+  },
+  "test/helpers/BarHelperTest.java > com.example.BarHelperTest > testProcess": {
+    "file": "test/helpers/BarHelperTest.java",
+    "fullName": "com.example.BarHelperTest > testProcess",
+    "title": "testProcess",
+    "describePath": "com.example.BarHelperTest",
+    "sourceLines": { "app/helpers/BarHelper.java": [5, 6, 7] }
+  },
+  "test/helpers/BarHelperTest.java > com.example.BarHelperTest > testEdgeCase": {
+    "file": "test/helpers/BarHelperTest.java",
+    "fullName": "com.example.BarHelperTest > testEdgeCase",
+    "title": "testEdgeCase",
+    "describePath": "com.example.BarHelperTest",
+    "sourceLines": { "app/helpers/BarHelper.java": [5, 6, 7] }
+  },
+  "test/helpers/BazHelperTest.java > com.example.BazHelperTest > testFragile": {
+    "file": "test/helpers/BazHelperTest.java",
+    "fullName": "com.example.BazHelperTest > testFragile",
+    "title": "testFragile",
+    "describePath": "com.example.BazHelperTest",
+    "sourceLines": { "app/helpers/BazHelper.java": [20, 21] }
+  }
+}

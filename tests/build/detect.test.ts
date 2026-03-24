@@ -76,6 +76,22 @@ describe('detectRunner', () => {
     expect(detectRunner('/project')).toBe('gradle');
   });
 
+  it('returns "play" when --runner=play is passed', () => {
+    expect(detectRunner('/any', 'play')).toBe('play');
+  });
+
+  it('auto-detects play when conf/routes and app/controllers/ both exist', () => {
+    mockExistsSync.mockImplementation(p =>
+      String(p).endsWith('conf/routes') || String(p).endsWith('app/controllers'),
+    );
+    expect(detectRunner('/project')).toBe('play');
+  });
+
+  it('does not auto-detect play from conf/routes alone (no app/controllers)', () => {
+    mockExistsSync.mockImplementation(p => String(p).endsWith('conf/routes'));
+    expect(detectRunner('/project')).not.toBe('play');
+  });
+
   it('detects gradle from build.gradle', () => {
     mockExistsSync.mockImplementation(p => String(p).endsWith('build.gradle'));
     expect(detectRunner('/project')).toBe('gradle');

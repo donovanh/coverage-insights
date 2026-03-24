@@ -8,16 +8,8 @@ vi.mock('child_process', () => ({
   execFile: vi.fn(),
 }));
 
-vi.mock('../../src/setup/gradle-listener.js', () => ({
-  ensureListenerJar: vi.fn().mockReturnValue('/fake/listener.jar'),
-}));
-
 import { execFileSync, execFile } from 'child_process';
 import { gradleRunner, _resetSession } from '../../src/build/runners/gradle.js';
-import { generateInitScript } from '../../src/build/runners/gradle/init-script.js';
-import { ensureListenerJar } from '../../src/setup/gradle-listener.js';
-
-const mockEnsureListenerJar = vi.mocked(ensureListenerJar);
 
 const mockExecFileSync = vi.mocked(execFileSync);
 const mockExecFile = vi.mocked(execFile);
@@ -32,6 +24,12 @@ const SUREFIRE_JUNIT = `<?xml version="1.0" encoding="UTF-8"?>
   <testcase name="skippedTest" classname="com.example.FormatterTest" time="0.0">
     <skipped/>
   </testcase>
+</testsuite>`;
+
+// Minimal Surefire XML for a KoTest spec
+const SUREFIRE_KOTEST = `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.example.CalculatorSpec" tests="1">
+  <testcase name="Calculator - should add two numbers" classname="com.example.CalculatorSpec" time="0.2"/>
 </testsuite>`;
 
 // Minimal JaCoCo XML
@@ -90,7 +88,7 @@ function writeKotlinTestFile(projectRoot: string, module: string, pkg: string, c
   fs.writeFileSync(path.join(dir, `${className}.kt`), content);
 }
 
-// Write fake JaCoCo XML at the path the init script produces (used by aggregate tests only)
+// Write fake JaCoCo XML at the path the init script would produce
 function writeJacocoXml(baseDir: string, moduleName: string, content: string) {
   const dir = path.join(baseDir, moduleName);
   fs.mkdirSync(dir, { recursive: true });
@@ -446,6 +444,7 @@ describe('gradleRunner.runOne', () => {
     fs.mkdirSync(root);
     fs.mkdirSync(workerDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
+    // Write fake JaCoCo XML that runOne would find
     writeJacocoXml(workerDir, 'application', JACOCO_XML);
 
     const tc = {
@@ -503,91 +502,6 @@ describe('gradleRunner.runOne', () => {
     const testsIdx = args.indexOf('--tests');
     expect(args[testsIdx + 1]).toContain('\\*');
   });
-
-  it('passes -Pcoverage.insights.xmlDir to gradle', async () => {
-    const root = path.join(tmpDir, 'project');
-    const workerDir = path.join(tmpDir, 'worker-0');
-    fs.mkdirSync(root);
-    fs.mkdirSync(workerDir, { recursive: true });
-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-    writeJacocoXml(workerDir, 'application', JACOCO_XML);
-
-    const tc = {
-      filePath: path.join(root, 'application'),
-      fullName: 'com.example.FormatterTest > shouldFormatDate',
-      title: 'shouldFormatDate',
-      describePath: 'com.example.FormatterTest',
-    };
-
-    await gradleRunner.runOne(tc, root, workerDir, undefined);
-
-    const args = mockExecFile.mock.calls[0][1] as string[];
-    expect(args.some(a => a.startsWith('-Pcoverage.insights.xmlDir='))).toBe(true);
-    expect(args.every(a => !a.startsWith('-Pcoverage.insights.jsonDir='))).toBe(true);
-  });
-
-  it('writes empty coverage-final.json when no jacoco XML produced', async () => {
-    const root = path.join(tmpDir, 'project');
-    const workerDir = path.join(tmpDir, 'worker-0');
-    fs.mkdirSync(root);
-    fs.mkdirSync(workerDir, { recursive: true });
-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-    // No XML written — simulates test with no coverage data
-
-    const tc = {
-      filePath: path.join(root, 'application'),
-      fullName: 'com.example.FormatterTest > shouldFormatDate',
-      title: 'shouldFormatDate',
-      describePath: 'com.example.FormatterTest',
-    };
-
-    await gradleRunner.runOne(tc, root, workerDir, undefined);
-    const json = fs.readFileSync(path.join(workerDir, 'coverage-final.json'), 'utf8');
-    expect(json).toBe('{}');
-  });
-
-  it('uses : prefix for root-project tests to avoid running submodule test tasks', async () => {
-    const root = path.join(tmpDir, 'project');
-    const workerDir = path.join(tmpDir, 'worker-0');
-    fs.mkdirSync(root);
-    fs.mkdirSync(workerDir, { recursive: true });
-    // No settings.gradle.kts — root project, no submodules
-    writeJacocoXml(workerDir, '', JACOCO_XML);
-
-    const tc = {
-      filePath: root,  // filePath is the root — pathToModule returns ''
-      fullName: 'com.example.FormatterTest > shouldFormatDate',
-      title: 'shouldFormatDate',
-      describePath: 'com.example.FormatterTest',
-    };
-
-    await gradleRunner.runOne(tc, root, workerDir, undefined);
-    const args = mockExecFile.mock.calls[0][1] as string[];
-    expect(args[0]).toBe(':test');  // ':test' not 'test'
-  });
-
-});
-
-describe('generateInitScript', () => {
-  it('includes coverage.insights.jsonDir property check in redirect block', () => {
-    const script = generateInitScript(false);
-    expect(script).toContain('coverage.insights.jsonDir');
-    expect(script).toContain('ExecFileLoader');
-    expect(script).toContain('CoverageBuilder');
-    expect(script).toContain('coverage-final.json');
-  });
-
-  it('includes coverage.insights.jsonDir property check in injection block', () => {
-    const script = generateInitScript(true);
-    expect(script).toContain('coverage.insights.jsonDir');
-    expect(script).toContain('ExecFileLoader');
-  });
-
-  it('still wires finalizedBy when jsonDir not set (XML mode)', () => {
-    const script = generateInitScript(false);
-    expect(script).toContain('finalizedBy');
-    expect(script).toContain('jacocoTestReport');
-  });
 });
 
 describe('gradleRunner.aggregate', () => {
@@ -615,76 +529,5 @@ describe('gradleRunner.aggregate', () => {
     await gradleRunner.aggregate(root, aggregateDir, undefined);
     expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('no jacoco.xml'));
     stderrSpy.mockRestore();
-  });
-});
-
-describe('gradleRunner.runAll', () => {
-  it('calls gradlew test --no-daemon with pertest.dir property', async () => {
-    const root = path.join(tmpDir, 'project');
-    const workDir = path.join(tmpDir, 'batch');
-    fs.mkdirSync(root);
-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-
-    await gradleRunner.runAll!(root, workDir);
-
-    const testCall = mockExecFile.mock.calls.find(c => (c[1] as string[])[0] === 'test');
-    expect(testCall).toBeDefined();
-    const args = testCall![1] as string[];
-    expect(args).toContain('--no-daemon');
-    expect(args.some(a => a.startsWith('-Pcoverage.insights.pertest.dir='))).toBe(true);
-  });
-
-  it('calls gradlew coverageInsightsBatchReport --no-daemon after tests', async () => {
-    const root = path.join(tmpDir, 'project');
-    const workDir = path.join(tmpDir, 'batch');
-    fs.mkdirSync(root);
-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-
-    await gradleRunner.runAll!(root, workDir);
-
-    const batchCall = mockExecFile.mock.calls.find(c => (c[1] as string[]).includes('coverageInsightsBatchReport'));
-    expect(batchCall).toBeDefined();
-    const args = batchCall![1] as string[];
-    expect(args).toContain('--no-daemon');
-    expect(args.some(a => a.startsWith('-Pcoverage.insights.pertest.dir='))).toBe(true);
-  });
-
-  it('passes listenerJar path from ensureListenerJar to the test invocation', async () => {
-    const root = path.join(tmpDir, 'project');
-    const workDir = path.join(tmpDir, 'batch');
-    fs.mkdirSync(root);
-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-    mockEnsureListenerJar.mockReturnValue('/custom/path/listener.jar');
-
-    await gradleRunner.runAll!(root, workDir);
-
-    const testCall = mockExecFile.mock.calls.find(c => (c[1] as string[])[0] === 'test');
-    expect(testCall).toBeDefined();
-    const args = testCall![1] as string[];
-    expect(args).toContain('-Pcoverage.insights.listener.jar=/custom/path/listener.jar');
-  });
-
-  it('does not throw if the test run fails', async () => {
-    const root = path.join(tmpDir, 'project');
-    const workDir = path.join(tmpDir, 'batch');
-    fs.mkdirSync(root);
-    fs.writeFileSync(path.join(root, 'settings.gradle.kts'), 'include(":application")');
-
-    // Make the test run call invoke callback with an error (simulating test failures),
-    // batchReport should still run
-    mockExecFile.mockImplementation((_cmd, args: unknown, _opts, cb) => {
-      const a = args as string[];
-      if (a[0] === 'test') {
-        setImmediate(() => (cb as (e: null) => void)(null));  // swallowed — test failures OK
-      } else {
-        setImmediate(() => (cb as (e: null) => void)(null));
-      }
-      return undefined as unknown as ReturnType<typeof execFile>;
-    });
-
-    await expect(gradleRunner.runAll!(root, workDir)).resolves.toBeUndefined();
-
-    const batchCall = mockExecFile.mock.calls.find(c => (c[1] as string[]).includes('coverageInsightsBatchReport'));
-    expect(batchCall).toBeDefined();
   });
 });
