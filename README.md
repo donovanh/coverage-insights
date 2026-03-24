@@ -64,34 +64,53 @@ coverage-insights --no-html
 
 ```bash
 # Auto-detected from build.gradle.kts
-coverage-insights --html
+coverage-insights
 
 # Force Gradle runner explicitly
-coverage-insights --runner=gradle --html
+coverage-insights --runner=gradle
 
 # Limit to a specific module (substring match on module path)
-coverage-insights --runner=gradle --file=application --html
+coverage-insights --runner=gradle --file=application
 ```
-
-**Supported test engines:** JUnit 5 (Jupiter) and KoTest. Both are discovered and isolated automatically.
 
 **Requirements:**
 - JDK on `PATH` (`JAVA_HOME` set)
 - Gradle wrapper (`./gradlew`) in the project root, or `gradle` on `PATH`
 - Multi-module projects: `settings.gradle.kts` or `settings.gradle` with `include(...)` entries
 
-**Known limitations:**
+### Standard Gradle projects (JUnit 5 / KoTest)
+
+Supported out of the box. Tests are discovered and run in isolation one at a time, each in its own Gradle invocation. JaCoCo coverage is collected per test and aggregated at the end.
+
+**Supported test engines:** JUnit 5 (Jupiter) and KoTest.
+
+### Play Framework projects (JUnit 4)
+
+Play Framework projects use JUnit 4 and have a different source layout (`app/` rather than `src/main/java/`). Both are handled automatically.
+
+Because Play Framework's heavy classloading makes repeated per-test JVM startups impractical, `coverage-insights` uses **batch mode**: a single Gradle invocation runs all tests and a JUnit 4 `RunListener` dumps per-test JaCoCo exec data after each test case. The results are then converted to per-test JSON coverage files without spawning additional JVMs.
+
+On the first run, a small listener JAR is compiled from bundled Java source and cached at `~/.coverage-insights/listener.jar`. Subsequent runs reuse the cached JAR (invalidated by SHA-256 hash if the source changes).
+
+> **Note:** If your project overrides `jacocoClasspath` (e.g. to pin a specific JaCoCo version), the standard `jacocoAnt` Gradle configuration may be empty. `coverage-insights` falls back to resolving JaCoCo jars from the buildscript classpath automatically.
+
+**Known limitations specific to batch mode:**
+- JUnit 4 only — JUnit 5 / KoTest tests will not produce per-test output in batch mode
+- In multi-module projects, each subproject's batch conversion only sees that subproject's own compiled classes
+
+### General known limitations
+
 - Maven is not supported (Gradle only)
 - Branch coverage is not reported — JaCoCo's bytecode-level branch model doesn't map to the Istanbul format used internally
 - The `--file` flag filters by **module name substring**, not a file glob (e.g. `--file=application` runs only the `:application` module)
-- Per-test runs invoke Gradle once per test, which incurs JVM startup overhead each time — use `--file` to limit scope on large projects
 
 ## Output
 
 Results are written to `coverage-insights/` (or your `--out` path):
 
-- `report.html` — interactive HTML report (with `--html`)
-- `test-line-map.json` — raw per-test line coverage data
+- `report.html` — interactive HTML report
+- `test-line-map.json` — raw per-test line coverage data, keyed by `"<file> > <test name>"`
+- `coverage-summary.json` — aggregate coverage summary (line %, function %, per file)
 
 ### Report sections
 
@@ -104,21 +123,6 @@ Results are written to `coverage-insights/` (or your `--out` path):
 | **Fragile lines** | Source lines covered by exactly one test |
 | **Uncovered functions** | Functions never called during the test run |
 | **Low coverage files** | Source files below the line coverage threshold |
-
-## Publishing a new version
-
-```bash
-# Bump patch version (0.1.0 → 0.1.1), build, test, publish
-npm run release:patch
-
-# Minor bump (0.1.0 → 0.2.0)
-npm run release:minor
-
-# Major bump (0.1.0 → 1.0.0)
-npm run release:major
-```
-
-Run `npm run test:integration` manually before releasing to catch any regressions in the subprocess-based integration tests.
 
 ## Licence
 
