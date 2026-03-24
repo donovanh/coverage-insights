@@ -28,8 +28,14 @@ export const jestRunner: Runner = {
     }
     if (!rawJson.trim()) return [];
 
+    // npm/npx may print WARN/notice lines before the JSON — strip them
+    const lines = rawJson.split('\n');
+    const jsonStart = lines.findIndex(l => l.trimStart().startsWith('{'));
+    if (jsonStart < 0) return [];
+    const jsonStr = lines.slice(jsonStart).join('\n');
+
     // Jest JSON format: testResults[].name is the file path, testResults[].assertionResults are the tests
-    const report = JSON.parse(rawJson) as {
+    const report = JSON.parse(jsonStr) as {
       testResults?: Array<{
         name: string;
         assertionResults?: Array<{
