@@ -11,12 +11,14 @@ import { generateInitScript, detectJacoco } from './gradle/init-script.js';
 let _gradleCmd: string | undefined;
 let _initScriptPath: string | undefined;
 let _daemonCacheDir: string | undefined;
+let _isBatchProject = false;
 
 /** For testing only — reset session state between tests. */
 export function _resetSession(): void {
   _gradleCmd = undefined;
   _initScriptPath = undefined;
   _daemonCacheDir = undefined;
+  _isBatchProject = false;
 }
 
 function ensureSession(projectRoot: string): void {
@@ -293,6 +295,34 @@ function mergeJacocoDir(dir: string, projectRoot: string): void {
   fs.writeFileSync(path.join(dir, 'coverage-final.json'), JSON.stringify(merged), 'utf8');
 }
 
+/** Batch mode: single Gradle invocation for all tests (JUnit 4 / Play Framework). */
+async function runAllImpl(projectRoot: string, workDir: string, testCases?: TestCase[]): Promise<void> {
+  ensureSession(projectRoot);
+  const gradleCmd  = _gradleCmd!;
+  const initScript = _initScriptPath!;
+  fs.mkdirSync(workDir, { recursive: true });
+  // Write filter file so batchConvert only processes the discovered test subset.
+  if (testCases && testCases.length > 0) {
+    const filterNames = testCases.map(tc =>
+      (tc.describePath + '.' + tc.title).replace(/[^a-zA-Z0-9._-]/g, '_'),
+    );
+    fs.writeFileSync(path.join(workDir, '.ci-filter.txt'), filterNames.join('\n'), 'utf8');
+  }
+  // PID-based port avoids conflicts if two coverage-insights processes run simultaneously.
+  const port = 6300 + (process.pid % 1000);
+  await new Promise<void>(resolve => {
+    execFile(gradleCmd, [
+      ':test',
+      '--no-daemon',
+      '--init-script', initScript,
+      `-Pcoverage.insights.pertest.dir=${workDir}`,
+      `-Pcoverage.insights.pertest.port=${port}`,
+    ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, () => resolve()); // swallow errors — test failures OK
+  });
+  // batchConvert runs inline in the Gradle process via the TestListener's afterSuite hook,
+  // writing per-test JSON files to workDir. No second Gradle invocation needed.
+}
+
 export const gradleRunner: Runner = {
   // Gradle incurs JVM startup overhead per test; keep concurrency low by default.
   defaultConcurrency: 2,
@@ -318,6 +348,18 @@ export const gradleRunner: Runner = {
     }
 
     testCases.push(...resolveJavaTestCases(javaClasses));
+
+    // Enable batch mode only for JUnit 4 projects. JUnit 4 test files import from
+    // org.junit.* (e.g. org.junit.Test), while JUnit 5 uses org.junit.jupiter.*
+    _isBatchProject = javaClasses.some(cls =>
+      cls.imports.some(imp =>
+        imp.startsWith('org.junit.') &&
+        !imp.startsWith('org.junit.jupiter') &&
+        !imp.startsWith('org.junit.platform'),
+      ),
+    );
+    gradleRunner.runAll = _isBatchProject ? runAllImpl : undefined;
+
     return testCases;
   },
 
@@ -354,33 +396,6 @@ export const gradleRunner: Runner = {
 
     // Convert JaCoCo XML(s) produced by jacocoTestReport into coverage-final.json.
     mergeJacocoDir(workerDir, projectRoot);
-  },
-
-  async runAll(projectRoot: string, workDir: string, testCases?: TestCase[]): Promise<void> {
-    ensureSession(projectRoot);
-    const gradleCmd  = _gradleCmd!;
-    const initScript = _initScriptPath!;
-    fs.mkdirSync(workDir, { recursive: true });
-    // Write filter file so batchConvert only processes the discovered test subset.
-    if (testCases && testCases.length > 0) {
-      const filterNames = testCases.map(tc =>
-        (tc.describePath + '.' + tc.title).replace(/[^a-zA-Z0-9._-]/g, '_'),
-      );
-      fs.writeFileSync(path.join(workDir, '.ci-filter.txt'), filterNames.join('\n'), 'utf8');
-    }
-    // PID-based port avoids conflicts if two coverage-insights processes run simultaneously.
-    const port = 6300 + (process.pid % 1000);
-    await new Promise<void>(resolve => {
-      execFile(gradleCmd, [
-        ':test',
-        '--no-daemon',
-        '--init-script', initScript,
-        `-Pcoverage.insights.pertest.dir=${workDir}`,
-        `-Pcoverage.insights.pertest.port=${port}`,
-      ], { cwd: projectRoot, maxBuffer: 50 * 1024 * 1024 }, () => resolve()); // swallow errors — test failures OK
-    });
-    // batchConvert runs inline in the Gradle process via the TestListener's afterSuite hook,
-    // writing per-test JSON files to workDir. No second Gradle invocation needed.
   },
 
   async aggregate(projectRoot, aggregateDir, _configPath) {

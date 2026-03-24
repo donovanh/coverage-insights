@@ -25,24 +25,26 @@ describe('generateInitScript', () => {
     expect(generateInitScript(true)).toContain('finalizedBy');
   });
 
-  it('includes listener JAR classpath wiring when pertest.dir property is present', () => {
+  it('uses TCP server mode and ExecDumpClient when pertest.dir property is present', () => {
     const script = generateInitScript(false);
     expect(script).toContain('coverage.insights.pertest.dir');
-    expect(script).toContain('classpath += files(listenerJar)');
-    expect(script).toContain('systemProperty("coverage.insights.pertest.dir"');
-  });
-
-  it('registers coverageInsightsBatchReport task when pertest.dir property is present', () => {
-    const script = generateInitScript(false);
-    expect(script).toContain('coverageInsightsBatchReport');
+    expect(script).toContain('TCP_SERVER');
+    expect(script).toContain('ExecDumpClient');
     expect(script).toContain('batchConvert(');
   });
 
-  it('injection variant also includes pertest support', () => {
+  it('wires TestListener afterTest to dump exec data per test', () => {
+    const script = generateInitScript(false);
+    expect(script).toContain('addTestListener');
+    expect(script).toContain('afterTest');
+    expect(script).toContain('afterSuite');
+  });
+
+  it('injection variant also includes pertest TCP server support', () => {
     const script = generateInitScript(true);
     expect(script).toContain('coverage.insights.pertest.dir');
-    expect(script).toContain('classpath += files(listenerJar)');
-    expect(script).toContain('coverageInsightsBatchReport');
+    expect(script).toContain('TCP_SERVER');
+    expect(script).toContain('ExecDumpClient');
   });
 
   it('without pertest property, existing behaviour includes finalizedBy', () => {
