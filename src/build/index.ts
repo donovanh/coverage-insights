@@ -12,6 +12,7 @@ export interface BuildOptions {
   noAggregate?: boolean;
   fileFilter?: string;
   configPath?: string;
+  includeIntegration?: boolean;
 }
 
 export interface BuildResult {
@@ -20,7 +21,7 @@ export interface BuildResult {
 }
 
 export interface Runner {
-  discover(projectRoot: string, fileFilter: string | undefined, configPath: string | undefined): Promise<TestCase[]>;
+  discover(projectRoot: string, fileFilter: string | undefined, configPath: string | undefined, includeIntegration?: boolean): Promise<TestCase[]>;
   runOne(tc: TestCase, projectRoot: string, workerDir: string, configPath: string | undefined): Promise<void>;
   runAll?(projectRoot: string, workDir: string, testCases?: TestCase[]): Promise<void>;
   aggregate(projectRoot: string, aggregateDir: string, configPath: string | undefined): Promise<void>;
@@ -188,12 +189,12 @@ function streamWriteJson(filePath: string, obj: Record<string, unknown>): void {
 
 export async function build(opts: BuildOptions, runner: Runner): Promise<BuildResult> {
   const defaultConcurrency = runner.defaultConcurrency ?? CPU_CONCURRENCY;
-  const { projectRoot, outDir, concurrency = defaultConcurrency, noAggregate, fileFilter, configPath } = opts;
+  const { projectRoot, outDir, concurrency = defaultConcurrency, noAggregate, fileFilter, configPath, includeIntegration } = opts;
 
   fs.mkdirSync(outDir, { recursive: true });
 
   // ── Step 1: Discover ─────────────────────────────────────────────────────────
-  const testCases = await runner.discover(projectRoot, fileFilter, configPath);
+  const testCases = await runner.discover(projectRoot, fileFilter, configPath, includeIntegration);
   if (testCases.length === 0) return { map: {}, summary: {} };
 
   const isTTY = process.stderr.isTTY;

@@ -327,7 +327,7 @@ export const gradleRunner: Runner = {
   // Gradle incurs JVM startup overhead per test; keep concurrency low by default.
   defaultConcurrency: 2,
 
-  async discover(projectRoot, fileFilter, _configPath) {
+  async discover(projectRoot, fileFilter, _configPath, includeIntegration = false) {
     ensureSession(projectRoot);
     const modules    = parseModules(projectRoot);
     const sourceDirs = findTestSourceDirs(projectRoot, modules);
@@ -347,7 +347,17 @@ export const gradleRunner: Runner = {
       }
     }
 
-    testCases.push(...resolveJavaTestCases(javaClasses));
+    // Filter integration tests by class naming convention unless --integration is set.
+    // Covers the most common patterns: *IT, *ITCase, *IntegrationTest(s).
+    const IT_SUFFIXES = /(?:IT|ITCase|IntegrationTests?)$/;
+    const filteredClasses = includeIntegration
+      ? javaClasses
+      : javaClasses.filter(cls => {
+          const simpleName = cls.fqcn.split('.').pop() ?? cls.fqcn;
+          return !IT_SUFFIXES.test(simpleName);
+        });
+
+    testCases.push(...resolveJavaTestCases(filteredClasses));
 
     // Enable batch mode only for JUnit 4 projects. JUnit 4 test files import from
     // org.junit.* (e.g. org.junit.Test), while JUnit 5 uses org.junit.jupiter.*

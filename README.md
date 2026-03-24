@@ -38,6 +38,7 @@ coverage-insights [options]
 | `--config=<path>` | auto | Path to vitest/jest config file |
 | `--runner=vitest\|jest\|gradle` | auto | Force a specific runner (otherwise auto-detected) |
 | `--concurrency=<n>` | auto | Max parallel test runs |
+| `--integration` | off | Include integration tests (Gradle only; classes named `*IT`, `*IntegrationTest`, etc. are skipped by default) |
 
 ### Examples
 

@@ -32,6 +32,7 @@ function parseArgs(argv: string[]): {
   fileFilter?: string;
   configPath?: string;
   runnerFlag?: string;
+  includeIntegration: boolean;
 } {
   const args = argv.slice(2);
   const get = (prefix: string): string | undefined => {
@@ -52,7 +53,8 @@ function parseArgs(argv: string[]): {
   // Play runner skips aggregate by default — ITests can't run in isolation so
   // the aggregate JaCoCo pass adds noise without meaningful signal.
   const noAggregate = args.includes('--no-aggregate') || fileFilter !== undefined || runnerFlag === 'play';
-  const openHtml    = !args.includes('--no-open');
+  const openHtml          = !args.includes('--no-open');
+  const includeIntegration = args.includes('--integration');
   const companion   = get('--companion=') ? path.resolve(get('--companion=')!) : undefined;
   const configPath  = get('--config=') ? path.resolve(get('--config=')!) : undefined;
   const rawConc     = get('--concurrency=');
@@ -65,11 +67,11 @@ function parseArgs(argv: string[]): {
     topN:                 get('--top=') ? parseInt(get('--top=')!, 10) : undefined,
   };
 
-  return { root, outDir, html, noBuild, noAggregate, openHtml, companion, opts, concurrency, fileFilter, configPath, runnerFlag };
+  return { root, outDir, html, noBuild, noAggregate, openHtml, companion, opts, concurrency, fileFilter, configPath, runnerFlag, includeIntegration };
 }
 
 export async function main(): Promise<void> {
-  const { root, outDir, html, noBuild, noAggregate, openHtml, companion, opts, concurrency, fileFilter, configPath, runnerFlag } = parseArgs(process.argv);
+  const { root, outDir, html, noBuild, noAggregate, openHtml, companion, opts, concurrency, fileFilter, configPath, runnerFlag, includeIntegration } = parseArgs(process.argv);
 
   if (!fs.existsSync(root)) {
     process.stderr.write(`Error: project root does not exist: ${root}\n`);
@@ -101,7 +103,7 @@ export async function main(): Promise<void> {
                  : runnerName === 'gradle' ? gradleRunner
                  : runnerName === 'play'   ? playRunner
                  : vitestRunner;
-    ({ map, summary } = await build({ projectRoot: root, outDir, concurrency, noAggregate, fileFilter, configPath }, runner));
+    ({ map, summary } = await build({ projectRoot: root, outDir, concurrency, noAggregate, fileFilter, configPath, includeIntegration }, runner));
   }
 
   const report = analyse(map, summary, opts);
