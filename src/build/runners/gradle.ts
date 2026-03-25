@@ -312,7 +312,7 @@ async function runAllImpl(projectRoot: string, workDir: string, testCases?: Test
   const port = 6300 + (process.pid % 1000);
   await new Promise<void>(resolve => {
     execFile(gradleCmd, [
-      ':test',
+      'test',
       '--no-daemon',
       '--init-script', initScript,
       `-Pcoverage.insights.pertest.dir=${workDir}`,
