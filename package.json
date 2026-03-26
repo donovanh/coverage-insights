@@ -26,6 +26,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "postbuild": "chmod +x dist/cli.js",
     "test": "vitest run",
     "lint": "eslint src tests --config eslint.config.mjs",
     "test:integration": "vitest run --config vitest.integration.config.ts",
