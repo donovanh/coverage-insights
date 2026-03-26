@@ -157,19 +157,9 @@ fun batchConvert(
 const REDIRECT_BLOCK = `
 allprojects {
     plugins.withId("jacoco") {
-        tasks.withType<JacocoReport> {
-            val baseDir = providers.gradleProperty("coverage.insights.xmlDir").orNull
-            if (baseDir != null) {
-                // Redirect execution data to the worker-specific file to prevent
-                // concurrent runOne workers clobbering each other's exec output.
-                executionData.setFrom(files("\$baseDir/test.exec"))
-                reports {
-                    xml.required.set(true)
-                    xml.outputLocation.set(file("\$baseDir/\${project.path.trimStart(':').replace(':', '/')}/jacoco.xml"))
-                }
-            }
-        }
         tasks.withType<Test> {
+            // Skip integration test tasks — only instrument the primary unit test task.
+            if (name != "test") return@withType
             outputs.upToDateWhen { false }
             jvmArgs("-XX:TieredStopAtLevel=1")
             val pertestDir = providers.gradleProperty("coverage.insights.pertest.dir").orNull
@@ -223,14 +213,25 @@ allprojects {
                         batchConvert(pertestDir, classesFiles, srcDirsSet, project)
                     }
                 })
-            } else {
-                // Per-test (runOne) mode: redirect exec file to worker-specific dir.
-                if (xmlDir != null) {
-                    extensions.configure<JacocoTaskExtension> {
-                        destinationFile = file("\$xmlDir/test.exec")
-                    }
+            } else if (xmlDir != null) {
+                // Per-test (runOne) mode: redirect exec file to worker dir, then generate XML via
+                // a dedicated task that has no dependency on integration test tasks.
+                extensions.configure<JacocoTaskExtension> {
+                    destinationFile = file("\$xmlDir/test.exec")
                 }
-                finalizedBy("jacocoTestReport")
+                // Root projects may have JaCoCo applied (e.g. via configureCrossModuleTestCoverage)
+                // without a main source set — skip report task creation in that case.
+                val mainSourceSet = try { project.the<SourceSetContainer>().findByName("main") } catch (e: Exception) { null }
+                if (mainSourceSet != null) {
+                    val ciReport = tasks.maybeCreate("coverageInsightsReport", JacocoReport::class.java)
+                    ciReport.executionData.setFrom(files("\$xmlDir/test.exec"))
+                    ciReport.sourceSets(mainSourceSet)
+                    ciReport.reports {
+                        xml.required.set(true)
+                        xml.outputLocation.set(file("\$xmlDir/\${project.path.trimStart(':').replace(':', '/')}/jacoco.xml"))
+                    }
+                    finalizedBy(ciReport)
+                }
             }
         }
     }
@@ -241,7 +242,7 @@ allprojects {
 const INJECTION_BLOCK = `
 allprojects {
     pluginManager.withPlugin("java") {
-        apply(plugin = "jacoco")
+        if (!pluginManager.hasPlugin("jacoco")) apply(plugin = "jacoco")
         val testTask = tasks.findByName("test") as? Test ?: return@withPlugin
         val pertestDir = providers.gradleProperty("coverage.insights.pertest.dir").orNull
         val xmlDir     = providers.gradleProperty("coverage.insights.xmlDir").orNull
@@ -295,26 +296,25 @@ allprojects {
                     batchConvert(pertestDir, classesFiles, srcDirsSet, project)
                 }
             })
-        } else {
-            val reportTask = tasks.maybeCreate("jacocoTestReport", JacocoReport::class.java).apply {
-                dependsOn(testTask)
-                sourceSets(the<SourceSetContainer>()["main"])
-                if (xmlDir != null) {
+        } else if (xmlDir != null) {
+            // Per-test (runOne) mode: use a dedicated task that has no dependency on
+            // integration test tasks, so jacocoTestReport's iTest chain is bypassed.
+            testTask.extensions.configure<JacocoTaskExtension> {
+                destinationFile = file("\$xmlDir/test.exec")
+            }
+            // Root projects may not have a main source set — skip report task if absent.
+            val mainSourceSet = try { the<SourceSetContainer>().findByName("main") } catch (e: Exception) { null }
+            if (mainSourceSet != null) {
+                val reportTask = tasks.maybeCreate("coverageInsightsReport", JacocoReport::class.java).apply {
+                    sourceSets(mainSourceSet)
                     executionData.setFrom(files("\$xmlDir/test.exec"))
                     reports {
                         xml.required.set(true)
                         xml.outputLocation.set(file("\$xmlDir/\${project.path.trimStart(':').replace(':', '/')}/jacoco.xml"))
                     }
-                } else {
-                    executionData(testTask)
                 }
+                testTask.finalizedBy(reportTask)
             }
-            if (xmlDir != null) {
-                testTask.extensions.configure<JacocoTaskExtension> {
-                    destinationFile = file("\$xmlDir/test.exec")
-                }
-            }
-            testTask.finalizedBy(reportTask)
         }
     }
 }`;

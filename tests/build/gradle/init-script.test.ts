@@ -49,7 +49,7 @@ describe('generateInitScript', () => {
 
   it('without pertest property, existing behaviour includes finalizedBy', () => {
     const script = generateInitScript(false);
-    expect(script).toContain('finalizedBy("jacocoTestReport")');
+    expect(script).toContain('finalizedBy(ciReport)');
   });
 });
 
